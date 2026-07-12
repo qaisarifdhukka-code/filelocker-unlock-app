@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 72" width="340" height="72">
+
+  <!-- Icon: 52x62 scaled to 58h, centered vertically: y=(72-58)/2=7 -->
+  <g transform="translate(4, 6) scale(0.935)">
+    <path d="M4 8C4 4.69 6.69 2 10 2H34L50 18V54C50 57.31 47.31 60 44 60H10C6.69 60 4 57.31 4 54V8Z" fill="#2563EB"/>
+    <path d="M34 2L50 18H38C35.79 18 34 16.21 34 14V2Z" fill="#1D4ED8"/>
+    <circle cx="27" cy="33" r="8" fill="none" stroke="white" stroke-width="2.4"/>
+    <circle cx="27" cy="31" r="3.2" fill="white"/>
+    <path d="M24 35H30L28.5 43H25.5L24 35Z" fill="white"/>
+  </g>
+
+  <!-- Wordmark: single text element, tspan for color change — no gap -->
+  <text
+    x="62" y="51"
+    font-family="Arial Black, Arial, Helvetica, sans-serif"
+    font-weight="900"
+    font-size="42"
+    letter-spacing="-1.5">
+    <tspan fill="#0A0A12">File</tspan><tspan fill="#2563EB">Locker</tspan>
+  </text>
+
+</svg>
