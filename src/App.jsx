@@ -314,7 +314,7 @@ export default function App() {
               
               <div className="mb-6">
                 <label className="block text-[14px] font-medium text-[#16191f] mb-1">
-                  Vault Drive location <span className="text-[#0073bb] font-normal cursor-help hover:underline">(Where is it?)</span>
+                  Vault file location <span className="text-[#0073bb] font-normal cursor-help hover:underline">(Where is it?)</span>
                 </label>
                 <div className="text-[13px] text-[#545b64]">
                   Open the <strong>Vault_Data</strong> folder on this USB drive and select your <code>.vault</code> file to decrypt it.
