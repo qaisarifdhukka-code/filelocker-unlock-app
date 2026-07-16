@@ -112,7 +112,7 @@ export default function App() {
 
       // Verify magic
       for (let i = 0; i < 4; i++) {
-        if (fixedArr[i] !== MAGIC_EXPECTED[i]) throw new Error('Not a valid VaultLocker file.');
+        if (fixedArr[i] !== MAGIC_EXPECTED[i]) throw new Error('Not a valid FileLocker file.');
       }
       const version = fixedArr[4]; // for future use
       const metaLen = new DataView(fixedBuf).getUint32(HEADER_BASE, true);
