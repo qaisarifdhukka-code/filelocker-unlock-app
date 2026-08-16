@@ -28,13 +28,14 @@ export default function App() {
   const [file,     setFile]     = useState(null);
   const [meta,     setMeta]     = useState(null);
   const [password, setPassword] = useState('');
-  const [status,   setStatus]   = useState('IDLE'); // IDLE | DECRYPTING | DONE | ERROR
-  const [progress, setProgress] = useState(0);
+  const [status, setStatus] = useState('IDLE'); // IDLE, DECRYPTING, ERROR, DONE
+  const [isDeriving, setIsDeriving] = useState(false);
   const [decryptStage, setDecryptStage] = useState(0); // 0: Key, 1: Chunks, 2: Finalizing
   const [errorMsg, setErrorMsg] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isEmbedded,   setIsEmbedded]   = useState(false);
   const [branding,     setBranding]     = useState(null);
+  const [progress, setProgress] = useState(0);
 
   // ── Auto-load embedded vault (Single-File Mode) ────────────────────────────
   // The provisioning app injects a <script id="vault-payload" type="text/plain">
@@ -137,11 +138,10 @@ export default function App() {
   // ── Decrypt vault ──────────────────────────────────────────────────────────
   const decryptVault = async () => {
     if (!password) { setErrorMsg('Please enter a password.'); return; }
+    if (isDeriving) return;
 
     try {
-      setStatus('DECRYPTING');
-      setProgress(0);
-      setDecryptStage(0);
+      setIsDeriving(true);
       setErrorMsg('');
 
       // Derive key with Argon2id
@@ -163,8 +163,48 @@ export default function App() {
         false, 
         ['decrypt']
       );
+
+      let downloadName = meta.originalName;
+      if (meta.encryptedName) {
+        try {
+          const encNameBuf = hexToBytes(meta.encryptedName);
+          const nameIv = encNameBuf.slice(0, 12);
+          const nameTag = encNameBuf.slice(12, 28);
+          const nameData = encNameBuf.slice(28);
+          const combinedName = new Uint8Array(nameData.byteLength + nameTag.byteLength);
+          combinedName.set(new Uint8Array(nameData), 0);
+          combinedName.set(new Uint8Array(nameTag), nameData.byteLength);
+          const decName = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nameIv }, key, combinedName);
+          downloadName = new TextDecoder().decode(decName);
+        } catch(e) {
+          throw new Error('Invalid password or corrupted vault file.');
+        }
+      }
+
+      // PRE-FLIGHT CHECK: Attempt to decrypt the first chunk to verify the password
+      // BEFORE asking the user where to save the file.
+      const dataStart = meta.dataStart;
+      const dataSize  = file.size - dataStart;
+      
+      const firstChunkBuf = await file.slice(dataStart, dataStart + CHUNK_ENC).arrayBuffer();
+      if (firstChunkBuf.byteLength >= 28) {
+        const iv       = firstChunkBuf.slice(0, 12);
+        const tag      = firstChunkBuf.slice(12, 28);
+        const data     = firstChunkBuf.slice(28);
+        const combined = new Uint8Array(data.byteLength + tag.byteLength);
+        combined.set(new Uint8Array(data), 0);
+        combined.set(new Uint8Array(tag), data.byteLength);
+        // If password is wrong, this will throw an OperationError instantly
+        await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, combined);
+      }
       
       setPassword('');
+
+      // If we reach here, the password is correct!
+      setIsDeriving(false);
+      setStatus('DECRYPTING');
+      setProgress(0);
+      setDecryptStage(1);
 
       // Prompt save location or prepare fallback
       let writable;
@@ -172,16 +212,11 @@ export default function App() {
       const isFallback = !window.showSaveFilePicker;
 
       if (!isFallback) {
-        const saveFh = await window.showSaveFilePicker({ suggestedName: meta.originalName });
+        const saveFh = await window.showSaveFilePicker({ suggestedName: downloadName });
         writable = await saveFh.createWritable();
       }
-
-      const dataStart = meta.dataStart;
-      const dataSize  = file.size - dataStart;
-      let   offset    = dataStart;
+      let offset = dataStart;
       
-      setDecryptStage(1);
-
       while (offset < file.size) {
         const chunkBuf = await file.slice(offset, offset + CHUNK_ENC).arrayBuffer();
         if (chunkBuf.byteLength < 28) break; // too small to be a valid chunk
@@ -210,7 +245,7 @@ export default function App() {
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = meta.originalName;
+        a.download = downloadName;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
@@ -221,11 +256,13 @@ export default function App() {
       setStatus('DONE');
     } catch (err) {
       console.error(err);
-      setStatus('ERROR');
+      setIsDeriving(false);
+      setStatus('IDLE');
+      const msg = err.message || '';
       setErrorMsg(
-        err.message.includes('auth') || err.message.includes('operation')
-          ? 'Invalid password or corrupted vault file.'
-          : err.message
+        err.name === 'OperationError' || msg.includes('auth') || msg.includes('operation') || msg.includes('Invalid password')
+          ? 'Invalid password. Please try again.'
+          : (msg || 'Decryption failed.')
       );
     }
   };
@@ -381,9 +418,13 @@ export default function App() {
                 )}
               </div>
 
-              <button onClick={decryptVault}
-                className="w-full py-1.5 px-4 rounded-[2px] bg-[#2563EB] font-bold text-white hover:bg-[#1d4ed8] transition-colors border border-[#1e40af] shadow-[0_1px_1px_rgba(0,0,0,0.1)]">
-                Unlock &amp; Download
+              <button onClick={decryptVault} disabled={isDeriving}
+                className={`w-full py-1.5 px-4 rounded-[2px] font-bold text-white transition-colors border shadow-[0_1px_1px_rgba(0,0,0,0.1)] flex items-center justify-center ${isDeriving ? 'bg-blue-400 border-blue-400 cursor-wait' : 'bg-[#2563EB] hover:bg-[#1d4ed8] border-[#1e40af]'}`}>
+                {isDeriving ? (
+                  <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Verifying...</>
+                ) : (
+                  'Unlock & Download'
+                )}
               </button>
 
               {errorMsg && (
