@@ -1,7 +1,11 @@
 import { useState, useEffect, useCallback } from 'react';
 import { argon2id } from 'hash-wasm';
 import { motion, AnimatePresence } from 'framer-motion';
-import { CheckCircle2, Circle, Loader2, XCircle, AlertCircle, ShieldAlert } from 'lucide-react';
+import { ShieldAlert, AlertCircle, Loader2, Eye, EyeOff, Download, FileText, CheckCircle2, Circle, XCircle } from 'lucide-react';
+import SecurePDFViewer from './components/SecurePDFViewer';
+import SecureImageViewer from './components/SecureImageViewer';
+import { SecureMediaViewer } from './components/SecureMediaViewer';
+import { APP_CONFIG } from './config';
 import logoUrl from './assets/filelocker-logo-main.svg';
 import logoDarkUrl from './assets/filelocker-logo-main-dark.svg';
 import heroBg from './assets/hero.png';
@@ -22,20 +26,92 @@ function hexToBytes(hex) {
   return b;
 }
 
-// Progress UI elements removed (ProgressRing not needed anymore)
+// ─── MIME type map for Secure Viewer ──────────────────────────────────────────
+function getMimeType(ext) {
+  const map = {
+    '.pdf':  'application/pdf',
+    '.png':  'image/png',
+    '.jpg':  'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif':  'image/gif',
+    '.webp': 'image/webp',
+    '.svg':  'image/svg+xml',
+    '.mp4':  'video/mp4',
+    '.webm': 'video/webm',
+    '.mov':  'video/quicktime',
+    '.mp3':  'audio/mpeg',
+    '.wav':  'audio/wav',
+    '.ogg':  'audio/ogg',
+    '.m4a':  'audio/mp4',
+    '.txt':  'text/plain',
+    '.md':   'text/plain',
+    '.csv':  'text/csv',
+    '.json': 'application/json',
+    '.xml':  'application/xml',
+    '.log':  'text/plain',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function getViewerType(ext) {
+  if (['.pdf'].includes(ext)) return 'pdf';
+  if (['.png','.jpg','.jpeg','.gif','.webp','.svg'].includes(ext)) return 'image';
+  if (['.mp4','.webm','.mov'].includes(ext)) return 'video';
+  if (['.mp3','.wav','.ogg','.m4a'].includes(ext)) return 'audio';
+  if (['.txt','.md','.csv','.json','.xml','.log'].includes(ext)) return 'text';
+  return 'download_only';
+}
 
 export default function App() {
   const [file,     setFile]     = useState(null);
-  const [meta,     setMeta]     = useState(null);
+  const [meta, setMeta] = useState(null);
+  const [branding, setBranding] = useState(null);
+  const [isBlurred, setIsBlurred] = useState(false);
+
+  // Anti-Screenshot (Blur on Blur)
+  useEffect(() => {
+    const handleBlur = () => setIsBlurred(true);
+    const handleFocus = () => setIsBlurred(false);
+
+    window.addEventListener('blur', handleBlur);
+    window.addEventListener('focus', handleFocus);
+    
+    return () => {
+      window.removeEventListener('blur', handleBlur);
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, []);
   const [password, setPassword] = useState('');
-  const [status, setStatus] = useState('IDLE'); // IDLE, DECRYPTING, ERROR, DONE
+  const [status, setStatus] = useState('IDLE'); // IDLE, DECRYPTING, ERROR, DONE, VIEWING
   const [isDeriving, setIsDeriving] = useState(false);
   const [decryptStage, setDecryptStage] = useState(0); // 0: Key, 1: Chunks, 2: Finalizing
   const [errorMsg, setErrorMsg] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [isEmbedded,   setIsEmbedded]   = useState(false);
-  const [branding,     setBranding]     = useState(null);
   const [progress, setProgress] = useState(0);
+  const [viewerBlobUrl, setViewerBlobUrl] = useState(null);
+  const [textContent, setTextContent] = useState('');
+  const [isCloudLoading, setIsCloudLoading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState(0);
+
+  // References to OPFS files for cleanup
+  const activeOpfsHandles = React.useRef([]);
+  
+  const trackOpfsHandle = (handle) => {
+    activeOpfsHandles.current.push(handle);
+  };
+
+  const cleanupOpfs = async () => {
+    try {
+      const root = await navigator.storage.getDirectory();
+      for (const handle of activeOpfsHandles.current) {
+        try {
+          await root.removeEntry(handle.name);
+        } catch(e) {}
+      }
+      activeOpfsHandles.current = [];
+    } catch(e) {}
+  };
 
   // ── Auto-load embedded vault (Single-File Mode) ────────────────────────────
   // The provisioning app injects a <script id="vault-payload" type="text/plain">
@@ -83,7 +159,94 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => { loadEmbeddedVault(); }, [loadEmbeddedVault]);
+  // ── Auto-load cloud vault (Secure Link Mode) ──────────────────────────────
+  const loadCloudVault = useCallback(async () => {
+    // URL pattern: /:firmSlug/:linkId
+    const pathParts = window.location.pathname.split('/').filter(Boolean);
+    if (pathParts.length < 2) return false;
+
+    const linkId = pathParts[pathParts.length - 1];
+    
+    try {
+      setIsCloudLoading(true);
+      setErrorMsg('');
+      
+      // The API endpoint is POST /api/links/:link_id/download
+      const API_BASE = APP_CONFIG.API_URL;
+      const res = await fetch(`${API_BASE}/api/links/${linkId}/download`, {
+        method: 'POST'
+      });
+
+      if (!res.ok) {
+        let msg = 'Failed to download secure vault.';
+        try { const errData = await res.json(); if (errData.error) msg = errData.error; } catch(e) {}
+        throw new Error(msg);
+      }
+
+      const contentLengthStr = res.headers.get('content-length');
+      const totalBytes = contentLengthStr ? parseInt(contentLengthStr, 10) : 0;
+      
+      const LARGE_FILE_THRESHOLD = 150 * 1024 * 1024; // 150 MB
+      let vaultFile;
+
+      if (totalBytes > LARGE_FILE_THRESHOLD && navigator.storage) {
+        // Stream to OPFS
+        const root = await navigator.storage.getDirectory();
+        const handle = await root.getFileHandle(`download_${Date.now()}.vault`, { create: true });
+        trackOpfsHandle(handle);
+        const writable = await handle.createWritable();
+        
+        const reader = res.body.getReader();
+        let loaded = 0;
+        
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+          loaded += value.length;
+          if (totalBytes > 0) {
+            setDownloadProgress(Math.round((loaded / totalBytes) * 100));
+          }
+        }
+        await writable.close();
+        vaultFile = await handle.getFile();
+      } else {
+        // Standard in-memory blob for small files
+        const blob = await res.blob();
+        vaultFile = new File([blob], 'Secure_Delivery.vault', { type: 'application/octet-stream' });
+      }
+      
+      // Parse the fixed header
+      const fixedBuf = await vaultFile.slice(0, HEADER_BASE + META_LEN_SIZE).arrayBuffer();
+      const fixedArr = new Uint8Array(fixedBuf);
+      for (let i = 0; i < 4; i++) {
+        if (fixedArr[i] !== MAGIC_EXPECTED[i]) throw new Error('Not a valid FileLocker file.');
+      }
+      const metaLen = new DataView(fixedBuf).getUint32(HEADER_BASE, true);
+      
+      // Parse metadata
+      const metaStart = HEADER_BASE + META_LEN_SIZE;
+      const metaBuf   = await vaultFile.slice(metaStart, metaStart + metaLen).arrayBuffer();
+      const parsedMeta = JSON.parse(new TextDecoder().decode(metaBuf));
+      const dataStart  = metaStart + metaLen + NONCE_SIZE;
+
+      setFile(vaultFile);
+      setMeta({ ...parsedMeta, dataStart });
+      setBranding(parsedMeta.branding || null);
+      
+    } catch (err) {
+      setErrorMsg(err.message);
+    } finally {
+      setIsCloudLoading(false);
+    }
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (!loadEmbeddedVault()) {
+      loadCloudVault();
+    }
+  }, [loadEmbeddedVault, loadCloudVault]);
 
   // ── Select & parse vault header ────────────────────────────────────────────
   const selectVault = async () => {
@@ -206,14 +369,24 @@ export default function App() {
       setProgress(0);
       setDecryptStage(1);
 
-      // Prompt save location or prepare fallback
+      // In secure_view mode, ALWAYS collect into memory (never stream to disk)
+      const isSecureView = meta.viewerConfig?.mode === 'secure_view';
       let writable;
       let chunks = [];
-      const isFallback = !window.showSaveFilePicker;
+      const isFallback = !window.showSaveFilePicker || isSecureView;
+      
+      const LARGE_FILE_THRESHOLD = 150 * 1024 * 1024;
+      const useOPFSFallback = isFallback && (file.size >= LARGE_FILE_THRESHOLD) && navigator.storage;
+      let opfsDecryptedHandle = null;
 
       if (!isFallback) {
         const saveFh = await window.showSaveFilePicker({ suggestedName: downloadName });
         writable = await saveFh.createWritable();
+      } else if (useOPFSFallback) {
+        const root = await navigator.storage.getDirectory();
+        opfsDecryptedHandle = await root.getFileHandle(`decrypted_${Date.now()}_${downloadName}`, { create: true });
+        trackOpfsHandle(opfsDecryptedHandle);
+        writable = await opfsDecryptedHandle.createWritable();
       }
       let offset = dataStart;
       
@@ -231,8 +404,9 @@ export default function App() {
         combined.set(new Uint8Array(tag), data.byteLength);
 
         const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, combined);
-        if (isFallback) chunks.push(new Uint8Array(dec));
-        else await writable.write(dec);
+        if (!isFallback) await writable.write(dec);
+        else if (useOPFSFallback) await writable.write(dec);
+        else chunks.push(new Uint8Array(dec));
 
         offset += chunkBuf.byteLength;
         setProgress(Math.min(100, Math.round(((offset - dataStart) / dataSize) * 100)));
@@ -240,8 +414,34 @@ export default function App() {
 
       setDecryptStage(2);
 
-      if (isFallback) {
-        const blob = new Blob(chunks);
+      if (isSecureView) {
+        // Secure View mode: render in-browser viewer
+        const mimeType = getMimeType(meta.ext);
+        let blob;
+        if (useOPFSFallback) {
+          await writable.close();
+          blob = await opfsDecryptedHandle.getFile();
+        } else {
+          blob = new Blob(chunks, { type: mimeType });
+        }
+        
+        const url = URL.createObjectURL(blob);
+        const viewType = getViewerType(meta.ext);
+        if (viewType === 'text') {
+          // Pre-load text content for display
+          const text = await blob.text();
+          setTextContent(text);
+        }
+        setViewerBlobUrl(url);
+        setStatus('VIEWING');
+      } else if (isFallback) {
+        let blob;
+        if (useOPFSFallback) {
+          await writable.close();
+          blob = await opfsDecryptedHandle.getFile();
+        } else {
+          blob = new Blob(chunks);
+        }
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -250,10 +450,11 @@ export default function App() {
         a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
+        setStatus('DONE');
       } else {
         await writable.close();
+        setStatus('DONE');
       }
-      setStatus('DONE');
     } catch (err) {
       console.error(err);
       setIsDeriving(false);
@@ -271,8 +472,12 @@ export default function App() {
     setPassword('');
     setStatus('IDLE');
     setProgress(0);
+    setDownloadProgress(0);
     setDecryptStage(0);
     setErrorMsg('');
+    if (viewerBlobUrl) { URL.revokeObjectURL(viewerBlobUrl); setViewerBlobUrl(null); }
+    setTextContent('');
+    cleanupOpfs();
     // In embedded mode the vault is baked into the HTML — keep file & meta.
     if (!isEmbedded) {
       setFile(null);
@@ -290,7 +495,7 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen flex flex-col md:flex-row w-full bg-white">
+    <div className={`min-h-screen flex flex-col md:flex-row w-full bg-white transition-all duration-300 ${isBlurred ? 'blur-xl select-none pointer-events-none' : ''}`}>
       {branding && branding.primaryColor && (
         <style dangerouslySetInnerHTML={{__html: `
           :root { --brand-primary: ${branding.primaryColor}; }
@@ -349,19 +554,33 @@ export default function App() {
                 {branding?.firmName ? branding.firmName : "Vault Unlock"} <ShieldAlert className="w-[18px] h-[18px] ml-2 text-[#0073bb] stroke-[2px]" />
               </h2>
               
-              <div className="mb-6">
-                <label className="block text-[14px] font-medium text-[#16191f] mb-1">
-                  Vault file location <span className="text-[#0073bb] font-normal cursor-help hover:underline">(Where is it?)</span>
-                </label>
-                <div className="text-[13px] text-[#545b64]">
-                  Open the <strong>Vault_Data</strong> folder on this USB drive and select your <code>.vault</code> file to decrypt it.
+              {isCloudLoading ? (
+                <div className="flex flex-col items-center justify-center p-8 bg-[#f8f9fa] border rounded-[2px] mb-6 text-center" style={{ borderColor: '#eaeded' }}>
+                  <Loader2 className="w-8 h-8 text-[#0073bb] animate-spin mb-3" />
+                  <h3 className="text-[14px] font-bold text-[#16191f]">Downloading Secure Vault</h3>
+                  <p className="text-[13px] mt-1 text-[#545b64]">
+                    {downloadProgress > 0 
+                      ? `Fetching your encrypted delivery... ${downloadProgress}%` 
+                      : `Fetching your encrypted delivery from the cloud...`}
+                  </p>
+                  {downloadProgress > 0 && (
+                    <div className="w-full max-w-[200px] bg-gray-200 rounded-full h-1.5 mt-3 overflow-hidden">
+                      <div className="bg-[#0073bb] h-full rounded-full transition-all duration-300" style={{ width: `${downloadProgress}%` }}></div>
+                    </div>
+                  )}
                 </div>
-              </div>
-              
-              <button onClick={selectVault}
-                className="w-full py-1.5 px-4 rounded-[2px] bg-[#2563EB] font-bold text-white hover:bg-[#1d4ed8] transition-colors border border-[#1e40af] shadow-[0_1px_1px_rgba(0,0,0,0.1)]">
-                Select Vault File
-              </button>
+              ) : (
+                <>
+                  <div className="mb-6">
+                    <label className="block text-[14px] font-medium text-[#16191f] mb-1">
+                      Secure Document Delivery
+                    </label>
+                    <div className="text-[13px] text-[#545b64] p-4 bg-[#f8f9fa] border border-[#eaeded] rounded-lg text-center mt-4">
+                      Please use the secure link provided by your sender, or open your secure HTML package directly.
+                    </div>
+                  </div>
+                </>
+              )}
               
               {errorMsg && (
                 <div className="mt-6 p-3 rounded-[2px] text-[13px] border-l-4 border-[#d13212] bg-[#fdf3f1] text-[#d13212] flex items-start">
@@ -573,6 +792,134 @@ export default function App() {
               </button>
             </motion.div>
           )}
+
+          {/* STATE: VIEWING — Secure In-Browser Viewer */}
+          {status === 'VIEWING' && viewerBlobUrl && (() => {
+            const viewType = getViewerType(meta?.ext || '');
+            const cfg = meta?.viewerConfig || {};
+            const allowDownload = cfg.allowDownload;
+            const allowPrint = cfg.allowPrint;
+            const allowCopy = cfg.allowCopy;
+
+            const handleDownload = () => {
+              const a = document.createElement('a');
+              a.href = viewerBlobUrl;
+              a.download = meta?.originalName || 'file';
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+            };
+
+            const handlePrint = () => {
+              const iframe = document.createElement('iframe');
+              iframe.style.display = 'none';
+              iframe.src = viewerBlobUrl;
+              document.body.appendChild(iframe);
+              iframe.onload = () => { iframe.contentWindow.print(); };
+            };
+
+            const isCustomViewer = ['pdf', 'image', 'video', 'audio'].includes(viewType);
+
+            return (
+              <motion.div key="state-viewing" variants={fadeVariants} initial="initial" animate="animate" exit="exit" transition={{ duration: 0.2 }} className="text-left w-full">
+                {!isCustomViewer && (
+                  <div className="flex items-center justify-between mb-4 pb-3 border-b border-gray-200">
+                    <h2 className="text-[18px] font-bold text-[#16191f] flex items-center gap-2">
+                      <Eye className="w-5 h-5 text-[#2563EB]" /> Secure Viewer
+                    </h2>
+                    <div className="flex gap-2">
+                      {allowPrint && (
+                        <button onClick={handlePrint}
+                          className="px-3 py-1 text-[12px] font-bold rounded border border-gray-300 text-gray-700 hover:bg-gray-50 transition-colors">
+                          Print
+                        </button>
+                      )}
+                      {allowDownload && (
+                        <button onClick={handleDownload}
+                          className="px-3 py-1 text-[12px] font-bold rounded border border-[#1e40af] bg-[#2563EB] text-white hover:bg-[#1d4ed8] transition-colors flex items-center gap-1">
+                          <Download className="w-3.5 h-3.5" /> Download
+                        </button>
+                      )}
+                      <button onClick={reset}
+                        className="px-3 py-1 text-[12px] font-bold rounded border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors">
+                        Close
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* PDF */}
+                {viewType === 'pdf' && (
+                  <SecurePDFViewer 
+                    url={viewerBlobUrl} 
+                    meta={meta} 
+                    config={cfg} 
+                    onDownload={handleDownload} 
+                    onPrint={handlePrint} 
+                    onClose={reset}
+                  />
+                )}
+
+                {/* Image */}
+                {viewType === 'image' && (
+                  <SecureImageViewer 
+                    url={viewerBlobUrl} 
+                    meta={meta} 
+                    config={cfg} 
+                    onDownload={handleDownload} 
+                    onPrint={handlePrint} 
+                    onClose={reset}
+                  />
+                )}
+
+                {/* Video & Audio */}
+                {['video', 'audio'].includes(viewType) && (
+                  <SecureMediaViewer 
+                    blobUrl={viewerBlobUrl}
+                    type={viewType}
+                    fileName={meta?.originalName}
+                    config={cfg}
+                    email={null}
+                    onClose={reset}
+                  />
+                )}
+
+                {/* Text / Code */}
+                {viewType === 'text' && (
+                  <div
+                    className="w-full rounded border border-gray-200 bg-gray-50 overflow-auto font-mono text-[12px] text-gray-800 p-4 leading-relaxed whitespace-pre-wrap"
+                    style={{ maxHeight: '520px', userSelect: allowCopy ? 'text' : 'none' }}
+                  >
+                    {textContent}
+                  </div>
+                )}
+
+                {/* Download Only — unsupported preview format */}
+                {viewType === 'download_only' && (
+                  <div className="p-6 bg-gray-50 rounded border border-gray-200 flex flex-col items-center gap-4 text-center">
+                    <div className="text-5xl">📄</div>
+                    <p className="text-[14px] font-medium text-gray-700">{meta?.originalName}</p>
+                    <p className="text-[13px] text-gray-500">This file type cannot be previewed in the browser.</p>
+                    {allowDownload ? (
+                      <button onClick={handleDownload}
+                        className="flex items-center gap-2 px-4 py-2 bg-[#2563EB] text-white font-bold text-[13px] rounded border border-[#1e40af] hover:bg-[#1d4ed8] transition-colors">
+                        <Download className="w-4 h-4" /> Download File
+                      </button>
+                    ) : (
+                      <p className="text-[13px] text-amber-600 font-medium">⚠️ The sender has restricted downloading this file.</p>
+                    )}
+                  </div>
+                )}
+
+                {!isCustomViewer && (
+                  <p className="text-[11px] text-gray-400 mt-3 text-center">
+                    🔒 Secure Viewer · {allowDownload ? 'Download allowed' : 'Download restricted'} · {allowPrint ? 'Print allowed' : 'Print restricted'}
+                  </p>
+                )}
+              </motion.div>
+            );
+          })()}
+
           </AnimatePresence>
         </div>
       </div>
