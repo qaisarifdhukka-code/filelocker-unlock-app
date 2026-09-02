@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { argon2id } from 'hash-wasm';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ShieldAlert, AlertCircle, Loader2, Eye, EyeOff, Download, FileText, CheckCircle2, Circle, XCircle } from 'lucide-react';
@@ -161,6 +161,8 @@ export default function App() {
 
   // ── Auto-load cloud vault (Secure Link Mode) ──────────────────────────────
   const loadCloudVault = useCallback(async () => {
+    if (window.location.protocol === 'file:') return false;
+    
     // URL pattern: /:firmSlug/:linkId
     const pathParts = window.location.pathname.split('/').filter(Boolean);
     if (pathParts.length < 2) return false;
@@ -380,13 +382,21 @@ export default function App() {
       let opfsDecryptedHandle = null;
 
       if (!isFallback) {
-        const saveFh = await window.showSaveFilePicker({ suggestedName: downloadName });
-        writable = await saveFh.createWritable();
+        try {
+          const saveFh = await window.showSaveFilePicker({ suggestedName: downloadName });
+          writable = await saveFh.createWritable();
+        } catch (err) {
+          throw new Error(`Failed to save file: ${err.message}. If you are trying to save to a protected folder, please select a different location.`);
+        }
       } else if (useOPFSFallback) {
-        const root = await navigator.storage.getDirectory();
-        opfsDecryptedHandle = await root.getFileHandle(`decrypted_${Date.now()}_${downloadName}`, { create: true });
-        trackOpfsHandle(opfsDecryptedHandle);
-        writable = await opfsDecryptedHandle.createWritable();
+        try {
+          const root = await navigator.storage.getDirectory();
+          opfsDecryptedHandle = await root.getFileHandle(`decrypted_${Date.now()}_${downloadName}`, { create: true });
+          trackOpfsHandle(opfsDecryptedHandle);
+          writable = await opfsDecryptedHandle.createWritable();
+        } catch (err) {
+          throw new Error(`Secure View for large files requires browser local storage (OPFS), which is restricted when opening HTML files locally in this browser. Please use the secure cloud link instead, or ask the sender to allow downloading. (Technical error: ${err.message})`);
+        }
       }
       let offset = dataStart;
       
@@ -576,9 +586,13 @@ export default function App() {
                       Secure Document Delivery
                     </label>
                     <div className="text-[13px] text-[#545b64] p-4 bg-[#f8f9fa] border border-[#eaeded] rounded-lg text-center mt-4">
-                      Please use the secure link provided by your sender, or open your secure HTML package directly.
+                      Please use the secure link provided by your sender, open your secure HTML package directly, or select a Vault file.
                     </div>
                   </div>
+                  <button onClick={selectVault}
+                    className="w-full py-1.5 px-4 rounded-[2px] bg-[#2563EB] font-bold text-white hover:bg-[#1d4ed8] transition-colors border border-[#1e40af] shadow-[0_1px_1px_rgba(0,0,0,0.1)]">
+                    Select Vault File
+                  </button>
                 </>
               )}
               
