@@ -540,7 +540,7 @@ export default function App() {
           <p className="text-[13px] font-bold text-[#2563EB] tracking-wider uppercase mb-4">Enterprise Grade Security</p>
           <h2 className="text-[32px] lg:text-[40px] font-bold text-white leading-tight mb-6">Secure offline file delivery for professionals.</h2>
           <p className="text-[#94A3B8] text-[16px] lg:text-[18px] leading-relaxed">
-            Your sensitive files, encrypted to military standards and protected completely offline.
+            Your sensitive files, encrypted to military-grade standards and protected completely offline.
           </p>
         </div>
       </div>
