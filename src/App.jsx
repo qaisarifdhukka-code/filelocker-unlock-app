@@ -39,6 +39,7 @@ function getMimeType(ext) {
     '.mp4':  'video/mp4',
     '.webm': 'video/webm',
     '.mov':  'video/quicktime',
+    '.mkv':  'video/x-matroska',
     '.mp3':  'audio/mpeg',
     '.wav':  'audio/wav',
     '.ogg':  'audio/ogg',
@@ -56,7 +57,7 @@ function getMimeType(ext) {
 function getViewerType(ext) {
   if (['.pdf'].includes(ext)) return 'pdf';
   if (['.png','.jpg','.jpeg','.gif','.webp','.svg'].includes(ext)) return 'image';
-  if (['.mp4','.webm','.mov'].includes(ext)) return 'video';
+  if (['.mp4','.webm','.mov','.mkv'].includes(ext)) return 'video';
   if (['.mp3','.wav','.ogg','.m4a'].includes(ext)) return 'audio';
   if (['.txt','.md','.csv','.json','.xml','.log'].includes(ext)) return 'text';
   return 'download_only';
