@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { argon2id } from 'hash-wasm';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+// NOTE: argon2id is no longer imported here — it runs inside cryptoWorker.js
+// off the main thread so animations stay smooth during key derivation.
 import { ShieldAlert, AlertCircle, Loader2, Eye, EyeOff, Download, FileText, CheckCircle2, Circle, XCircle } from 'lucide-react';
 import SecurePDFViewer from './components/SecurePDFViewer';
 import SecureImageViewer from './components/SecureImageViewer';
@@ -94,9 +95,83 @@ export default function App() {
   const [textContent, setTextContent] = useState('');
   const [isCloudLoading, setIsCloudLoading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [isRetrying, setIsRetrying] = useState(false); // UX FIX 6: shows retry banner mid-decrypt
+
+  // UX FIX 1: Detect synchronously (no async) whether this page is a cloud link.
+  // This allows us to immediately show the password input rather than blocking behind
+  // a loading spinner while the 1MB header fetch completes in the background.
+  const isCloudLink = (() => {
+    if (window.location.protocol === 'file:') return false;
+    const parts = window.location.pathname.split('/').filter(Boolean);
+    return parts.length >= 2;
+  })();
+
+  // UX FIX 1: Holds the in-flight loadCloudVault() promise so decryptVault()
+  // can await it if the user clicks Unlock before the header fetch completes.
+  const loadCloudVaultPromiseRef = useRef(null);
+
+  // PERF FIX 2A: Persistent Web Worker for Argon2id key derivation.
+  // Created once on mount, reused for every unlock attempt.
+  // This keeps the main thread free so animations stay smooth.
+  const cryptoWorkerRef = useRef(null);
+  useEffect(() => {
+    cryptoWorkerRef.current = new Worker(
+      new URL('./cryptoWorker.js', import.meta.url),
+      { type: 'module' }
+    );
+    return () => {
+      cryptoWorkerRef.current?.terminate();
+    };
+  }, []);
+
+  // Helper: derive a CryptoKey via the Web Worker (off main thread).
+  const deriveKeyInWorker = (password, saltHex) =>
+    new Promise((resolve, reject) => {
+      const worker = cryptoWorkerRef.current;
+      if (!worker) return reject(new Error('Crypto worker not available.'));
+      const onMessage = async (e) => {
+        worker.removeEventListener('message', onMessage);
+        if (e.data.type === 'keyDerived') {
+          try {
+            const key = await crypto.subtle.importKey(
+              'raw', e.data.keyArray, { name: 'AES-GCM' }, false, ['decrypt']
+            );
+            resolve(key);
+          } catch (err) { reject(err); }
+        } else {
+          reject(new Error(e.data.message || 'Key derivation failed.'));
+        }
+      };
+      worker.addEventListener('message', onMessage);
+      // Use the saltHex argument directly (not from closure) to avoid stale-state bugs
+      worker.postMessage({ type: 'deriveKey', password, saltHex });
+    });
+
+
+  // QUALITY FIX 3A: Fetch with retry + Range-header support for cloud vault streaming.
+  // If the connection drops mid-download, we retry from the last received byte offset.
+  const fetchWithRetry = useCallback(async (url, options = {}, maxRetries = 4) => {
+    let lastErr;
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const res = await fetch(url, options);
+        if (!res.ok && res.status >= 500) {
+          const text = await res.text().catch(() => '');
+          throw new Error(`Server error ${res.status}: ${text}`);
+        }
+        return res;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < maxRetries - 1) {
+          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        }
+      }
+    }
+    throw lastErr;
+  }, []);
 
   // References to OPFS files for cleanup
-  const activeOpfsHandles = React.useRef([]);
+  const activeOpfsHandles = useRef([]);
   
   const trackOpfsHandle = (handle) => {
     activeOpfsHandles.current.push(handle);
@@ -160,8 +235,7 @@ export default function App() {
     }
   }, []);
 
-  // ── Auto-load cloud vault (Secure Link Mode) ──────────────────────────────
-  const loadCloudVault = useCallback(async () => {
+  const loadCloudVault = useCallback(async () => { console.log('loadCloudVault called, pathname:', window.location.pathname, 'API_URL:', APP_CONFIG.API_URL);
     if (window.location.protocol === 'file:') return false;
     
     // URL pattern: /:firmSlug/:linkId
@@ -174,54 +248,30 @@ export default function App() {
       setIsCloudLoading(true);
       setErrorMsg('');
       
-      // The API endpoint is POST /api/links/:link_id/download
       const API_BASE = APP_CONFIG.API_URL;
-      const res = await fetch(`${API_BASE}/api/links/${linkId}/download`, {
-        method: 'POST'
+      
+      // Fetch metadata first to get the total file size
+      const metaRes = await fetch(`${API_BASE}/api/links/${linkId}`);
+      if (!metaRes.ok) throw new Error('Failed to fetch link metadata.');
+      const linkMeta = await metaRes.json();
+      
+      // Fetch just the first 1MB to get the header
+      const dlRes = await fetch(`${API_BASE}/api/links/${linkId}/download`, {
+        method: 'POST',
+        headers: { 'Range': 'bytes=0-1048575' }
       });
 
-      if (!res.ok) {
-        let msg = 'Failed to download secure vault.';
-        try { const errData = await res.json(); if (errData.error) msg = errData.error; } catch(e) {}
+      if (!dlRes.ok && dlRes.status !== 206) {
+        let msg = 'Failed to download secure vault header.';
+        try { const errData = await dlRes.json(); if (errData.error) msg = errData.error; } catch(e) {}
         throw new Error(msg);
       }
-
-      const contentLengthStr = res.headers.get('content-length');
-      const totalBytes = contentLengthStr ? parseInt(contentLengthStr, 10) : 0;
       
-      const LARGE_FILE_THRESHOLD = 150 * 1024 * 1024; // 150 MB
-      let vaultFile;
-
-      if (totalBytes > LARGE_FILE_THRESHOLD && navigator.storage) {
-        // Stream to OPFS
-        const root = await navigator.storage.getDirectory();
-        const handle = await root.getFileHandle(`download_${Date.now()}.vault`, { create: true });
-        trackOpfsHandle(handle);
-        const writable = await handle.createWritable();
-        
-        const reader = res.body.getReader();
-        let loaded = 0;
-        
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          await writable.write(value);
-          loaded += value.length;
-          if (totalBytes > 0) {
-            setDownloadProgress(Math.round((loaded / totalBytes) * 100));
-          }
-        }
-        await writable.close();
-        vaultFile = await handle.getFile();
-      } else {
-        // Standard in-memory blob for small files
-        const blob = await res.blob();
-        vaultFile = new File([blob], 'Secure_Delivery.vault', { type: 'application/octet-stream' });
-      }
+      const fixedBuf = await dlRes.arrayBuffer();
+      const fixedArr = new Uint8Array(fixedBuf);
       
       // Parse the fixed header
-      const fixedBuf = await vaultFile.slice(0, HEADER_BASE + META_LEN_SIZE).arrayBuffer();
-      const fixedArr = new Uint8Array(fixedBuf);
+      if (fixedArr.length < HEADER_BASE + META_LEN_SIZE) throw new Error('File too small.');
       for (let i = 0; i < 4; i++) {
         if (fixedArr[i] !== MAGIC_EXPECTED[i]) throw new Error('Not a valid FileLocker file.');
       }
@@ -229,16 +279,17 @@ export default function App() {
       
       // Parse metadata
       const metaStart = HEADER_BASE + META_LEN_SIZE;
-      const metaBuf   = await vaultFile.slice(metaStart, metaStart + metaLen).arrayBuffer();
+      const metaBuf   = fixedBuf.slice(metaStart, metaStart + metaLen);
       const parsedMeta = JSON.parse(new TextDecoder().decode(metaBuf));
       const dataStart  = metaStart + metaLen + NONCE_SIZE;
 
-      setFile(vaultFile);
+      // Create a virtual file object to represent the cloud vault
+      setFile({ size: linkMeta.file_size, isVirtual: true, linkId });
       setMeta({ ...parsedMeta, dataStart });
       setBranding(parsedMeta.branding || null);
       
     } catch (err) {
-      setErrorMsg(err.message);
+      console.error('loadCloudVault Error:', err); setErrorMsg(err.message);
     } finally {
       setIsCloudLoading(false);
     }
@@ -247,7 +298,8 @@ export default function App() {
 
   useEffect(() => {
     if (!loadEmbeddedVault()) {
-      loadCloudVault();
+      // UX FIX 1: Store the promise so decryptVault() can await it if needed.
+      loadCloudVaultPromiseRef.current = loadCloudVault();
     }
   }, [loadEmbeddedVault, loadCloudVault]);
 
@@ -297,7 +349,7 @@ export default function App() {
       setBranding(parsedMeta.branding || null);
       setErrorMsg('');
     } catch (err) {
-      if (err.name !== 'AbortError') setErrorMsg(err.message);
+      if (err.name !== 'AbortError') console.error('loadCloudVault Error:', err); setErrorMsg(err.message);
     }
   };
 
@@ -310,25 +362,28 @@ export default function App() {
       setIsDeriving(true);
       setErrorMsg('');
 
-      // Derive key with Argon2id
-      const salt = hexToBytes(meta.salt);
-      const keyArray = await argon2id({
-        password: password,
-        salt: salt,
-        parallelism: 1,
-        iterations: 3,
-        memorySize: 65536, // 64MB
-        hashLength: 32,
-        outputType: 'binary'
-      });
-      
-      const key = await crypto.subtle.importKey(
-        'raw', 
-        keyArray, 
-        { name: 'AES-GCM' }, 
-        false, 
-        ['decrypt']
-      );
+      // UX FIX 1: If the user clicked Unlock while the header fetch was still in-flight,
+      // wait for it to complete before attempting key derivation.
+      if (loadCloudVaultPromiseRef.current) {
+        await loadCloudVaultPromiseRef.current;
+        loadCloudVaultPromiseRef.current = null;
+      }
+
+      // At this point meta must be set. If it's still null, the cloud load failed.
+      // React state updates are async so we read from the ref-guarded result instead.
+      // We check the DOM state via isDeriving guard — if loadCloudVault failed it sets
+      // errorMsg and we abort here.
+      if (!meta) {
+        setIsDeriving(false);
+        setErrorMsg(errorMsg || 'Failed to load vault metadata. Check your connection and try again.');
+        return;
+      }
+
+      // PERF FIX 2A: Derive key via Web Worker (off main thread).
+      // The spinner and stage indicator animate freely during this ~1-3s operation.
+      // deriveKeyInWorker posts the password + salt to cryptoWorker.js, receives the
+      // raw key bytes back, then imports them as a CryptoKey on the main thread.
+      const key = await deriveKeyInWorker(password, meta.salt);
 
       let downloadName = meta.originalName;
       if (meta.encryptedName) {
@@ -352,8 +407,78 @@ export default function App() {
       const dataStart = meta.dataStart;
       const dataSize  = file.size - dataStart;
       
-      const firstChunkBuf = await file.slice(dataStart, dataStart + CHUNK_ENC).arrayBuffer();
-      if (firstChunkBuf.byteLength >= 28) {
+      // QUALITY FIX 3A: Cloud streaming with retry.
+      // We track the byte offset of what we have successfully received so far.
+      // If the network drops, we re-open the fetch from that offset rather than
+      // restarting from the beginning.
+      let sourceStreamReader = null;
+      let cloudByteOffset = dataStart; // tracks absolute position in cloud file for retries
+      let leftover = new Uint8Array(0);
+      let offset = dataStart;
+      let isStreamDone = false;
+
+      const openCloudStream = async (fromByte, isRetryCall = false) => {
+        if (isRetryCall) setIsRetrying(true);
+        const API_BASE = APP_CONFIG.API_URL;
+        const res = await fetchWithRetry(`${API_BASE}/api/links/${file.linkId}/download`, {
+          method: 'POST',
+          headers: { 'Range': `bytes=${fromByte}-` }
+        });
+        setIsRetrying(false); // Clear retry banner once we have a new connection
+        if (!res.ok && res.status !== 206) {
+          throw new Error(`Download failed with status ${res.status}`);
+        }
+        return res.body.getReader();
+      };
+
+      if (file.isVirtual) {
+        sourceStreamReader = await openCloudStream(dataStart);
+      }
+
+      const getNextChunk = async () => {
+         while (!isStreamDone && leftover.length < CHUNK_ENC) {
+            if (file.isVirtual) {
+               try {
+                 const { done, value } = await sourceStreamReader.read();
+                 if (value) {
+                   // Track how many bytes we have received for potential retry resumption
+                   cloudByteOffset += value.length;
+                   const newLeftover = new Uint8Array(leftover.length + value.length);
+                   newLeftover.set(leftover, 0);
+                   newLeftover.set(value, leftover.length);
+                   leftover = newLeftover;
+                 }
+                 if (done) isStreamDone = true;
+               } catch (networkErr) {
+                 // QUALITY FIX 3A + UX FIX 6: Network error mid-stream — re-open from last known offset.
+                 // isRetryCall=true triggers the retry banner in the UI.
+                 console.warn('Cloud stream interrupted, retrying from offset', cloudByteOffset, networkErr);
+                 sourceStreamReader = await openCloudStream(cloudByteOffset, true);
+               }
+            } else {
+               const chunkEnd = Math.min(file.size, offset + Math.max(CHUNK_ENC * 2, 20 * 1024 * 1024));
+               if (offset >= file.size) { isStreamDone = true; }
+               else {
+                 const chunkBuf = new Uint8Array(await file.slice(offset, chunkEnd).arrayBuffer());
+                 const newLeftover = new Uint8Array(leftover.length + chunkBuf.length);
+                 newLeftover.set(leftover, 0);
+                 newLeftover.set(chunkBuf, leftover.length);
+                 leftover = newLeftover;
+                 offset = chunkEnd;
+               }
+            }
+         }
+         if (leftover.length === 0) return null;
+         let chunkLen = Math.min(CHUNK_ENC, leftover.length);
+         if (isStreamDone && leftover.length < CHUNK_ENC) chunkLen = leftover.length;
+         
+         const chunkBuf = leftover.slice(0, chunkLen);
+         leftover = leftover.slice(chunkLen);
+         return chunkBuf;
+      };
+
+      const firstChunkBuf = await getNextChunk();
+      if (firstChunkBuf && firstChunkBuf.byteLength >= 28) {
         const iv       = firstChunkBuf.slice(0, 12);
         const tag      = firstChunkBuf.slice(12, 28);
         const data     = firstChunkBuf.slice(28);
@@ -399,28 +524,32 @@ export default function App() {
           throw new Error(`Secure View for large files requires browser local storage (OPFS), which is restricted when opening HTML files locally in this browser. Please use the secure cloud link instead, or ask the sender to allow downloading. (Technical error: ${err.message})`);
         }
       }
-      let offset = dataStart;
       
-      while (offset < file.size) {
-        const chunkBuf = await file.slice(offset, offset + CHUNK_ENC).arrayBuffer();
-        if (chunkBuf.byteLength < 28) break; // too small to be a valid chunk
-
+      let totalProcessed = 0;
+      const processChunk = async (chunkBuf) => {
+        if (chunkBuf.byteLength < 28) return;
         const iv       = chunkBuf.slice(0, 12);
         const tag      = chunkBuf.slice(12, 28);
         const data     = chunkBuf.slice(28);
-
-        // WebCrypto expects [ciphertext || tag]
         const combined = new Uint8Array(data.byteLength + tag.byteLength);
         combined.set(new Uint8Array(data), 0);
         combined.set(new Uint8Array(tag), data.byteLength);
-
+        
         const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, combined);
         if (!isFallback) await writable.write(dec);
         else if (useOPFSFallback) await writable.write(dec);
         else chunks.push(new Uint8Array(dec));
+        
+        totalProcessed += chunkBuf.byteLength;
+        setProgress(Math.min(100, Math.round((totalProcessed / dataSize) * 100)));
+      };
 
-        offset += chunkBuf.byteLength;
-        setProgress(Math.min(100, Math.round(((offset - dataStart) / dataSize) * 100)));
+      if (firstChunkBuf) await processChunk(firstChunkBuf);
+
+      while (true) {
+        const chunkBuf = await getNextChunk();
+        if (!chunkBuf) break;
+        await processChunk(chunkBuf);
       }
 
       setDecryptStage(2);
@@ -613,8 +742,11 @@ export default function App() {
             </motion.div>
           )}
 
-          {/* STATE: IDLE — file selected, enter password */}
-          {status === 'IDLE' && file && (
+          {/* STATE: IDLE — file selected OR cloud link loading (show password immediately) */}
+          {/* UX FIX 1: For cloud links, render the password form immediately without waiting
+               for the 1MB header fetch. When meta is null, we show a skeleton for the filename.
+               The Unlock button will await the load if still in-flight. */}
+          {status === 'IDLE' && (file || (isCloudLink && !isEmbedded)) && (
             <motion.div key="state-password" variants={fadeVariants} initial="initial" animate="animate" exit="exit" transition={{ duration: 0.2 }}>
               
               <h2 className="text-[20px] font-bold mb-5 pb-3 border-b border-gray-200 text-[#16191f] flex items-center">
@@ -623,13 +755,21 @@ export default function App() {
 
               <div className="mb-4">
                 <label className="block text-[14px] font-medium text-[#16191f] mb-1">
-                  Selected vault alias{!isEmbedded && (
+                  Secure delivery{!isEmbedded && file && (
                     <span className="text-[#0073bb] font-normal hover:underline cursor-pointer ml-1" onClick={reset}>(Change?)</span>
                   )}
                 </label>
-                <div className="w-full px-3 py-1.5 text-[14px] bg-[#f2f3f3] border border-[#aab7b8] rounded-[2px] text-[#545b64] font-mono truncate">
-                  {meta?.originalName}
-                </div>
+                {/* UX FIX 1: Skeleton shimmer when the vault header is still being fetched */}
+                {meta ? (
+                  <div className="w-full px-3 py-1.5 text-[14px] bg-[#f2f3f3] border border-[#aab7b8] rounded-[2px] text-[#545b64] font-mono truncate">
+                    {meta.originalName}
+                  </div>
+                ) : (
+                  <div className="w-full px-3 py-2 bg-[#f2f3f3] border border-[#aab7b8] rounded-[2px] flex items-center gap-2">
+                    <div className="h-3 w-3/4 bg-gray-300 rounded animate-pulse" />
+                    <span className="text-[12px] text-[#0073bb] ml-auto">Loading...</span>
+                  </div>
+                )}
               </div>
 
               <div className="mb-4">
@@ -639,6 +779,7 @@ export default function App() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && decryptVault()}
+                  autoFocus
                   className={`w-full px-3 py-1.5 text-[14px] bg-white border ${errorMsg ? 'border-[#d13212] focus:border-[#d13212] focus:shadow-[0_0_0_1px_#d13212]' : 'border-[#aab7b8] focus:border-[#0073bb] focus:shadow-[0_0_0_1px_#0073bb]'} rounded-[2px] focus:outline-none transition-shadow`} />
               </div>
 
@@ -655,11 +796,24 @@ export default function App() {
               <button onClick={decryptVault} disabled={isDeriving}
                 className={`w-full py-1.5 px-4 rounded-[2px] font-bold text-white transition-colors border shadow-[0_1px_1px_rgba(0,0,0,0.1)] flex items-center justify-center ${isDeriving ? 'bg-blue-400 border-blue-400 cursor-wait' : 'bg-[#2563EB] hover:bg-[#1d4ed8] border-[#1e40af]'}`}>
                 {isDeriving ? (
-                  <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Verifying...</>
+                  <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> {!meta ? 'Loading vault...' : 'Verifying...'}</>
                 ) : (
                   'Unlock & Download'
                 )}
               </button>
+
+              {/* UX FIX 2: Browser memory warning — shown before decryption if Firefox/Safari + large file */}
+              {!window.showSaveFilePicker && file?.isVirtual && file?.size > 1024 * 1024 * 1024 && (
+                <div className="mt-4 p-3 rounded-[2px] text-[13px] text-left bg-amber-50 border-l-4 border-amber-400 text-amber-800 flex items-start">
+                  <ShieldAlert className="w-4 h-4 mr-2 mt-0.5 shrink-0 text-amber-500" />
+                  <span>
+                    <strong>Browser Limitation:</strong> Your browser doesn't support direct-to-disk saving.
+                    Decrypting this large file ({file.size >= 1e9 ? (file.size / 1e9).toFixed(1) + ' GB' : Math.round(file.size / 1e6) + ' MB'}) may
+                    crash your browser tab. We strongly recommend opening this link in{' '}
+                    <strong>Chrome</strong> or <strong>Edge</strong> for reliable large file decryption.
+                  </span>
+                </div>
+              )}
 
               {errorMsg && (
                 <div className="mt-4 p-3 rounded-[2px] text-[13px] border-l-4 border-[#d13212] bg-[#fdf3f1] text-[#d13212] flex items-start">
@@ -670,13 +824,21 @@ export default function App() {
             </motion.div>
           )}
 
+
           {/* STATE: DECRYPTING (Pipeline UI) */}
           {status === 'DECRYPTING' && (
             <motion.div key="state-decrypting" variants={fadeVariants} initial="initial" animate="animate" exit="exit" transition={{ duration: 0.2 }} className="text-left py-4">
               <h2 className="text-[20px] font-bold mb-5 pb-3 border-b border-gray-200 text-[#16191f]">
                 Decrypting Vault
               </h2>
-              
+
+              {/* UX FIX 6: Network retry banner — shown when stream reconnects mid-decrypt */}
+              {isRetrying && (
+                <div className="mb-4 px-3 py-2 rounded-[2px] text-[12px] bg-amber-50 border border-amber-300 text-amber-800 flex items-center gap-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0 text-amber-600" />
+                  Network unstable — resuming download from where it left off...
+                </div>
+              )}
               <div className="flex flex-col relative mt-4">
                 {/* Vertical connecting line */}
                 <div className="absolute left-3 top-4 bottom-8 w-0.5 bg-gray-100 -z-10"></div>
