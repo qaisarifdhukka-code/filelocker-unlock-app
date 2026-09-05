@@ -129,8 +129,17 @@ export default function App() {
     new Promise((resolve, reject) => {
       const worker = cryptoWorkerRef.current;
       if (!worker) return reject(new Error('Crypto worker not available.'));
-      const onMessage = async (e) => {
+      
+      const timeoutId = setTimeout(() => {
         worker.removeEventListener('message', onMessage);
+        worker.removeEventListener('error', onError);
+        reject(new Error('Key derivation timed out.'));
+      }, 15000);
+
+      const onMessage = async (e) => {
+        clearTimeout(timeoutId);
+        worker.removeEventListener('message', onMessage);
+        worker.removeEventListener('error', onError);
         if (e.data.type === 'keyDerived') {
           try {
             const key = await crypto.subtle.importKey(
@@ -142,7 +151,16 @@ export default function App() {
           reject(new Error(e.data.message || 'Key derivation failed.'));
         }
       };
+
+      const onError = (e) => {
+        clearTimeout(timeoutId);
+        worker.removeEventListener('message', onMessage);
+        worker.removeEventListener('error', onError);
+        reject(new Error('Crypto worker crashed or failed to load.'));
+      };
+
       worker.addEventListener('message', onMessage);
+      worker.addEventListener('error', onError);
       // Use the saltHex argument directly (not from closure) to avoid stale-state bugs
       worker.postMessage({ type: 'deriveKey', password, saltHex });
     });
@@ -290,10 +308,11 @@ export default function App() {
       
     } catch (err) {
       console.error('loadCloudVault Error:', err); setErrorMsg(err.message);
+      return { success: false, error: err.message };
     } finally {
       setIsCloudLoading(false);
     }
-    return true;
+    return { success: true };
   }, []);
 
   useEffect(() => {
@@ -365,14 +384,21 @@ export default function App() {
       // UX FIX 1: If the user clicked Unlock while the header fetch was still in-flight,
       // wait for it to complete before attempting key derivation.
       if (loadCloudVaultPromiseRef.current) {
-        await loadCloudVaultPromiseRef.current;
+        const cloudLoadResult = await loadCloudVaultPromiseRef.current;
         loadCloudVaultPromiseRef.current = null;
+        
+        // If the background cloud load failed, we must abort and show its error.
+        // This prevents the generic "Failed to load vault metadata" from overwriting
+        // a specific error like "Link is expired, consumed, or not found".
+        if (cloudLoadResult && cloudLoadResult.success === false) {
+           setIsDeriving(false);
+           setErrorMsg(cloudLoadResult.error || 'Failed to load vault metadata. Check your connection and try again.');
+           return;
+        }
       }
 
-      // At this point meta must be set. If it's still null, the cloud load failed.
-      // React state updates are async so we read from the ref-guarded result instead.
-      // We check the DOM state via isDeriving guard — if loadCloudVault failed it sets
-      // errorMsg and we abort here.
+      // At this point meta must be set. If it's still null, the cloud load failed
+      // before UX FIX 1 was added or in some other edge case.
       if (!meta) {
         setIsDeriving(false);
         setErrorMsg(errorMsg || 'Failed to load vault metadata. Check your connection and try again.');
@@ -687,44 +713,25 @@ export default function App() {
           </div>
 
           <AnimatePresence mode="wait">
-          {/* STATE: IDLE — no file selected */}
-          {status === 'IDLE' && !file && (
+          {/* STATE: IDLE — no file selected (only for local vault selection) */}
+          {status === 'IDLE' && !file && !(isCloudLink && !isEmbedded) && (
             <motion.div key="state-no-file" variants={fadeVariants} initial="initial" animate="animate" exit="exit" transition={{ duration: 0.2 }}>
               <h2 className="text-[20px] font-bold mb-5 pb-3 border-b border-gray-200 text-[#16191f] flex items-center">
                 {branding?.firmName ? branding.firmName : "Vault Unlock"} <ShieldAlert className="w-[18px] h-[18px] ml-2 text-[#0073bb] stroke-[2px]" />
               </h2>
               
-              {isCloudLoading ? (
-                <div className="flex flex-col items-center justify-center p-8 bg-[#f8f9fa] border rounded-[2px] mb-6 text-center" style={{ borderColor: '#eaeded' }}>
-                  <Loader2 className="w-8 h-8 text-[#0073bb] animate-spin mb-3" />
-                  <h3 className="text-[14px] font-bold text-[#16191f]">Downloading Secure Vault</h3>
-                  <p className="text-[13px] mt-1 text-[#545b64]">
-                    {downloadProgress > 0 
-                      ? `Fetching your encrypted delivery... ${downloadProgress}%` 
-                      : `Fetching your encrypted delivery from the cloud...`}
-                  </p>
-                  {downloadProgress > 0 && (
-                    <div className="w-full max-w-[200px] bg-gray-200 rounded-full h-1.5 mt-3 overflow-hidden">
-                      <div className="bg-[#0073bb] h-full rounded-full transition-all duration-300" style={{ width: `${downloadProgress}%` }}></div>
-                    </div>
-                  )}
+              <div className="mb-6">
+                <label className="block text-[14px] font-medium text-[#16191f] mb-1">
+                  Secure Document Delivery
+                </label>
+                <div className="text-[13px] text-[#545b64] p-4 bg-[#f8f9fa] border border-[#eaeded] rounded-lg text-center mt-4">
+                  Please use the secure link provided by your sender, open your secure HTML package directly, or select a Vault file.
                 </div>
-              ) : (
-                <>
-                  <div className="mb-6">
-                    <label className="block text-[14px] font-medium text-[#16191f] mb-1">
-                      Secure Document Delivery
-                    </label>
-                    <div className="text-[13px] text-[#545b64] p-4 bg-[#f8f9fa] border border-[#eaeded] rounded-lg text-center mt-4">
-                      Please use the secure link provided by your sender, open your secure HTML package directly, or select a Vault file.
-                    </div>
-                  </div>
-                  <button onClick={selectVault}
-                    className="w-full py-1.5 px-4 rounded-[2px] bg-[#2563EB] font-bold text-white hover:bg-[#1d4ed8] transition-colors border border-[#1e40af] shadow-[0_1px_1px_rgba(0,0,0,0.1)]">
-                    Select Vault File
-                  </button>
-                </>
-              )}
+              </div>
+              <button onClick={selectVault}
+                className="w-full py-1.5 px-4 rounded-[2px] bg-[#2563EB] font-bold text-white hover:bg-[#1d4ed8] transition-colors border border-[#1e40af] shadow-[0_1px_1px_rgba(0,0,0,0.1)]">
+                Select Vault File
+              </button>
               
               {errorMsg && (
                 <div className="mt-6 p-3 rounded-[2px] text-[13px] border-l-4 border-[#d13212] bg-[#fdf3f1] text-[#d13212] flex items-start">
