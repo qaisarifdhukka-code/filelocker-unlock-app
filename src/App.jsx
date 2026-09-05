@@ -97,7 +97,8 @@ export default function App() {
   const [isCloudLoading, setIsCloudLoading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [isRetrying, setIsRetrying] = useState(false); // UX FIX 6: shows retry banner mid-decrypt
-
+  const [saveLocationResolver, setSaveLocationResolver] = useState(null);
+  const [resolvedDownloadName, setResolvedDownloadName] = useState('');
   // UX FIX 1: Detect synchronously (no async) whether this page is a cloud link.
   // This allows us to immediately show the password input rather than blocking behind
   // a loading spinner while the 1MB header fetch completes in the background.
@@ -532,10 +533,20 @@ export default function App() {
       let opfsDecryptedHandle = null;
 
       if (!isFallback) {
+        setStatus('WAITING_FOR_SAVE');
+        setResolvedDownloadName(downloadName);
         try {
-          const saveFh = await window.showSaveFilePicker({ suggestedName: downloadName });
+          const saveFh = await new Promise((resolve, reject) => {
+            setSaveLocationResolver({ resolve, reject });
+          });
+          setSaveLocationResolver(null);
           writable = await saveFh.createWritable();
         } catch (err) {
+          setSaveLocationResolver(null);
+          if (err.name === 'AbortError') {
+             setStatus('IDLE');
+             return; // Silent cancel
+          }
           throw new Error(`Failed to save file: ${err.message}. If you are trying to save to a protected folder, please select a different location.`);
         }
       } else if (useOPFSFallback) {
@@ -751,7 +762,7 @@ export default function App() {
           {/* UX FIX 1: For cloud links, render the password form immediately without waiting
                for the 1MB header fetch. When meta is null, we show a skeleton for the filename.
                The Unlock button will await the load if still in-flight. */}
-          {status === 'IDLE' && (file || (isCloudLink && !isEmbedded)) && (
+          {(status === 'IDLE' || status === 'WAITING_FOR_SAVE') && (file || (isCloudLink && !isEmbedded)) && (
             <motion.div key="state-password" variants={fadeVariants} initial="initial" animate="animate" exit="exit" transition={{ duration: 0.2 }}>
               
               <h2 className="text-[20px] font-bold mb-5 pb-3 border-b border-gray-200 text-[#16191f] flex items-center">
@@ -798,14 +809,28 @@ export default function App() {
                 )}
               </div>
 
-              <button onClick={decryptVault} disabled={isDeriving}
-                className={`w-full py-1.5 px-4 rounded-[2px] font-bold text-white transition-colors border shadow-[0_1px_1px_rgba(0,0,0,0.1)] flex items-center justify-center ${isDeriving ? 'bg-blue-400 border-blue-400 cursor-wait' : 'bg-[#2563EB] hover:bg-[#1d4ed8] border-[#1e40af]'}`}>
-                {isDeriving ? (
-                  <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> {!meta ? 'Loading vault...' : 'Verifying...'}</>
-                ) : (
-                  'Unlock & Download'
-                )}
-              </button>
+              {status === 'WAITING_FOR_SAVE' ? (
+                <button onClick={async () => {
+                  try {
+                    const saveFh = await window.showSaveFilePicker({ suggestedName: resolvedDownloadName });
+                    saveLocationResolver?.resolve(saveFh);
+                  } catch (err) {
+                    saveLocationResolver?.reject(err);
+                  }
+                }}
+                  className="w-full py-1.5 px-4 rounded-[2px] font-bold text-white bg-[#10B981] hover:bg-[#059669] transition-colors border border-[#059669] shadow-[0_1px_1px_rgba(0,0,0,0.1)] flex items-center justify-center">
+                  <Download className="w-4 h-4 mr-2" /> Select Save Location & Download
+                </button>
+              ) : (
+                <button onClick={decryptVault} disabled={isDeriving}
+                  className={`w-full py-1.5 px-4 rounded-[2px] font-bold text-white transition-colors border shadow-[0_1px_1px_rgba(0,0,0,0.1)] flex items-center justify-center ${isDeriving ? 'bg-blue-400 border-blue-400 cursor-wait' : 'bg-[#2563EB] hover:bg-[#1d4ed8] border-[#1e40af]'}`}>
+                  {isDeriving ? (
+                    <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> {!meta ? 'Loading vault...' : 'Verifying...'}</>
+                  ) : (
+                    'Unlock & Download'
+                  )}
+                </button>
+              )}
 
               {/* UX FIX 2: Browser memory warning — shown before decryption if Firefox/Safari + large file */}
               {!window.showSaveFilePicker && file?.isVirtual && file?.size > 1024 * 1024 * 1024 && (
