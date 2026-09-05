@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 // NOTE: argon2id is no longer imported here — it runs inside cryptoWorker.js
 // off the main thread so animations stay smooth during key derivation.
 import { ShieldAlert, AlertCircle, Loader2, Eye, EyeOff, Download, FileText, CheckCircle2, Circle, XCircle } from 'lucide-react';
+import CryptoWorker from './cryptoWorker?worker&inline';
 import SecurePDFViewer from './components/SecurePDFViewer';
 import SecureImageViewer from './components/SecureImageViewer';
 import { SecureMediaViewer } from './components/SecureMediaViewer';
@@ -115,10 +116,7 @@ export default function App() {
   // This keeps the main thread free so animations stay smooth.
   const cryptoWorkerRef = useRef(null);
   useEffect(() => {
-    cryptoWorkerRef.current = new Worker(
-      new URL('./cryptoWorker.js', import.meta.url),
-      { type: 'module' }
-    );
+    cryptoWorkerRef.current = new CryptoWorker();
     return () => {
       cryptoWorkerRef.current?.terminate();
     };
