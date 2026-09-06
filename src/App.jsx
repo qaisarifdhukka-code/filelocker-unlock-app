@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { argon2id } from 'hash-wasm';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ShieldAlert, AlertCircle, Loader2, Eye, EyeOff, Download, FileText, CheckCircle2, Circle, XCircle } from 'lucide-react';
@@ -160,6 +160,8 @@ export default function App() {
     }
   }, []);
 
+  const hasAttemptedCloudLoad = useRef(false);
+
   // ── Auto-load cloud vault (Secure Link Mode) ──────────────────────────────
   const loadCloudVault = useCallback(async () => {
     if (window.location.protocol === 'file:') return false;
@@ -167,6 +169,9 @@ export default function App() {
     // URL pattern: /:firmSlug/:linkId
     const pathParts = window.location.pathname.split('/').filter(Boolean);
     if (pathParts.length < 2) return false;
+
+    if (hasAttemptedCloudLoad.current) return false;
+    hasAttemptedCloudLoad.current = true;
 
     const linkId = pathParts[pathParts.length - 1];
     
@@ -176,46 +181,73 @@ export default function App() {
       
       // The API endpoint is POST /api/links/:link_id/download
       const API_BASE = APP_CONFIG.API_URL;
-      const res = await fetch(`${API_BASE}/api/links/${linkId}/download`, {
-        method: 'POST'
+      // Use a HEAD request to get the content-length without downloading the body!
+      const initialRes = await fetch(`${API_BASE}/api/links/${linkId}/download`, {
+        method: 'HEAD'
       });
 
-      if (!res.ok) {
+      if (!initialRes.ok) {
         let msg = 'Failed to download secure vault.';
-        try { const errData = await res.json(); if (errData.error) msg = errData.error; } catch(e) {}
+        if (initialRes.status === 403) {
+          msg = 'Link is expired, consumed, or not found.';
+        } else if (initialRes.status === 404) {
+          msg = 'Secure link not found.';
+        }
         throw new Error(msg);
       }
 
-      const contentLengthStr = res.headers.get('content-length');
+      const contentLengthStr = initialRes.headers.get('content-length');
       const totalBytes = contentLengthStr ? parseInt(contentLengthStr, 10) : 0;
       
       const LARGE_FILE_THRESHOLD = 150 * 1024 * 1024; // 150 MB
       let vaultFile;
 
       if (totalBytes > LARGE_FILE_THRESHOLD && navigator.storage) {
-        // Stream to OPFS
+        // Stream to OPFS in chunks with retries
         const root = await navigator.storage.getDirectory();
         const handle = await root.getFileHandle(`download_${Date.now()}.vault`, { create: true });
         trackOpfsHandle(handle);
         const writable = await handle.createWritable();
         
-        const reader = res.body.getReader();
-        let loaded = 0;
+        const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB chunks
+        let offset = 0;
         
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          await writable.write(value);
-          loaded += value.length;
-          if (totalBytes > 0) {
-            setDownloadProgress(Math.round((loaded / totalBytes) * 100));
+        const fetchChunk = async (start, end, retries = 3) => {
+          for (let i = 0; i < retries; i++) {
+            try {
+              const res = await fetch(`${API_BASE}/api/links/${linkId}/download`, {
+                method: 'POST', // Use POST for range request as required by backend
+                headers: { 'Range': `bytes=${start}-${end}` }
+              });
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              return new Uint8Array(await res.arrayBuffer());
+            } catch (err) {
+              if (i === retries - 1) throw err;
+              await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+            }
           }
+        };
+
+        while (offset < totalBytes) {
+          const end = Math.min(offset + CHUNK_SIZE - 1, totalBytes - 1);
+          const chunkData = await fetchChunk(offset, end);
+          await writable.write(chunkData);
+          offset += chunkData.length;
+          setDownloadProgress(Math.round((offset / totalBytes) * 100));
         }
         await writable.close();
         vaultFile = await handle.getFile();
       } else {
-        // Standard in-memory blob for small files
-        const blob = await res.blob();
+        // Standard in-memory blob for small files (we still need to actually download it since we used HEAD)
+        const fullRes = await fetch(`${API_BASE}/api/links/${linkId}/download`, { method: 'POST' });
+        
+        if (!fullRes.ok) {
+          let msg = 'Failed to download secure vault.';
+          try { const errData = await fullRes.json(); if (errData.error) msg = errData.error; } catch(e) {}
+          throw new Error(msg);
+        }
+
+        const blob = await fullRes.blob();
         vaultFile = new File([blob], 'Secure_Delivery.vault', { type: 'application/octet-stream' });
       }
       
@@ -310,16 +342,23 @@ export default function App() {
       setIsDeriving(true);
       setErrorMsg('');
 
-      // Derive key with Argon2id
+      // Derive key with Argon2id using a Web Worker to prevent UI freezing
       const salt = hexToBytes(meta.salt);
-      const keyArray = await argon2id({
-        password: password,
-        salt: salt,
-        parallelism: 1,
-        iterations: 3,
-        memorySize: 65536, // 64MB
-        hashLength: 32,
-        outputType: 'binary'
+      const keyArray = await new Promise((resolve, reject) => {
+        const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+        worker.onmessage = (e) => {
+          if (e.data.success) {
+            resolve(e.data.keyArray);
+          } else {
+            reject(new Error(e.data.error));
+          }
+          worker.terminate();
+        };
+        worker.onerror = (err) => {
+          reject(new Error('Key derivation failed'));
+          worker.terminate();
+        };
+        worker.postMessage({ password, salt });
       });
       
       const key = await crypto.subtle.importKey(
