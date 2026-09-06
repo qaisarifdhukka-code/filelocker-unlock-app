@@ -6,6 +6,7 @@ import SecurePDFViewer from './components/SecurePDFViewer';
 import SecureImageViewer from './components/SecureImageViewer';
 import { SecureMediaViewer } from './components/SecureMediaViewer';
 import { APP_CONFIG } from './config';
+import Argon2Worker from './worker.js?worker&inline';
 import logoUrl from './assets/filelocker-logo-main.svg';
 import logoDarkUrl from './assets/filelocker-logo-main-dark.svg';
 import heroBg from './assets/hero.png';
@@ -345,7 +346,7 @@ export default function App() {
       // Derive key with Argon2id using a Web Worker to prevent UI freezing
       const salt = hexToBytes(meta.salt);
       const keyArray = await new Promise((resolve, reject) => {
-        const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+        const worker = new Argon2Worker();
         worker.onmessage = (e) => {
           if (e.data.success) {
             resolve(e.data.keyArray);
