@@ -95,6 +95,19 @@ export default function App() {
   const [textContent, setTextContent] = useState('');
   const [isCloudLoading, setIsCloudLoading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [isDragging, setIsDragging] = useState(false);
+
+  // Prevent accidental close during decryption
+  useEffect(() => {
+    const handleBeforeUnload = (e) => {
+      if (status === 'DECRYPTING' || isCloudLoading) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [status, isCloudLoading]);
 
   // References to OPFS files for cleanup
   const activeOpfsHandles = React.useRef([]);
@@ -284,28 +297,8 @@ export default function App() {
     }
   }, [loadEmbeddedVault, loadCloudVault]);
 
-  // ── Select & parse vault header ────────────────────────────────────────────
-  const selectVault = async () => {
+  const processSelectedVault = async (selected) => {
     try {
-      let selected;
-      if (window.showOpenFilePicker) {
-        const [fh] = await window.showOpenFilePicker({
-          types: [{ description: 'Vault Files', accept: { '*/*': ['.vault'] } }]
-        });
-        selected = await fh.getFile();
-      } else {
-        selected = await new Promise((resolve, reject) => {
-          const input = document.createElement('input');
-          input.type = 'file';
-          input.accept = '.vault';
-          input.onchange = (e) => {
-            if (e.target.files && e.target.files.length > 0) resolve(e.target.files[0]);
-            else reject(new Error('AbortError'));
-          };
-          input.click();
-        });
-      }
-
       // Read fixed header: MAGIC(4) + VERSION(1) + META_LEN(4)
       const fixedBuf = await selected.slice(0, HEADER_BASE + META_LEN_SIZE).arrayBuffer();
       const fixedArr = new Uint8Array(fixedBuf);
@@ -329,6 +322,69 @@ export default function App() {
       setMeta({ ...parsedMeta, dataStart });
       setBranding(parsedMeta.branding || null);
       setErrorMsg('');
+    } catch (err) {
+      if (err.name !== 'AbortError') setErrorMsg(err.message);
+    }
+  };
+
+  useEffect(() => {
+    const handleDragOver = (e) => {
+      e.preventDefault();
+      if (e.dataTransfer.types.includes('Files')) setIsDragging(true);
+    };
+    const handleDragLeave = (e) => {
+      e.preventDefault();
+      if (e.clientX === 0 && e.clientY === 0) setIsDragging(false);
+    };
+    const handleDrop = async (e) => {
+      e.preventDefault();
+      setIsDragging(false);
+      if (status !== 'IDLE' || file || isCloudLoading) return;
+
+      const droppedFiles = e.dataTransfer.files;
+      if (droppedFiles.length > 0) {
+        const selected = droppedFiles[0];
+        if (selected.name.endsWith('.vault')) {
+          await processSelectedVault(selected);
+        } else {
+          setErrorMsg('Please drop a valid .vault file.');
+        }
+      }
+    };
+
+    window.addEventListener('dragover', handleDragOver);
+    window.addEventListener('dragleave', handleDragLeave);
+    window.addEventListener('drop', handleDrop);
+
+    return () => {
+      window.removeEventListener('dragover', handleDragOver);
+      window.removeEventListener('dragleave', handleDragLeave);
+      window.removeEventListener('drop', handleDrop);
+    };
+  }, [status, file, isCloudLoading]);
+
+  // ── Select & parse vault header ────────────────────────────────────────────
+  const selectVault = async () => {
+    try {
+      let selected;
+      if (window.showOpenFilePicker) {
+        const [fh] = await window.showOpenFilePicker({
+          types: [{ description: 'Vault Files', accept: { '*/*': ['.vault'] } }]
+        });
+        selected = await fh.getFile();
+      } else {
+        selected = await new Promise((resolve, reject) => {
+          const input = document.createElement('input');
+          input.type = 'file';
+          input.accept = '.vault';
+          input.onchange = (e) => {
+            if (e.target.files && e.target.files.length > 0) resolve(e.target.files[0]);
+            else reject(new Error('AbortError'));
+          };
+          input.click();
+        });
+      }
+      await processSelectedVault(selected);
     } catch (err) {
       if (err.name !== 'AbortError') setErrorMsg(err.message);
     }
@@ -588,6 +644,23 @@ export default function App() {
       {/* Right Side: Interactive Panel */}
       <div className="w-full md:w-7/12 p-8 md:p-12 lg:p-20 flex flex-col justify-center items-center relative bg-white">
         
+        <AnimatePresence>
+          {isDragging && status === 'IDLE' && !file && !isCloudLoading && (
+            <motion.div 
+              initial={{ opacity: 0 }} 
+              animate={{ opacity: 1 }} 
+              exit={{ opacity: 0 }}
+              className="absolute inset-0 z-50 bg-white/80 backdrop-blur-sm border-4 border-dashed border-[#2563EB] flex flex-col items-center justify-center m-4 rounded-xl"
+            >
+              <div className="bg-[#2563EB] text-white p-4 rounded-full mb-4 shadow-lg">
+                <Download className="w-8 h-8" />
+              </div>
+              <h3 className="text-xl font-bold text-gray-900">Drop Vault File Here</h3>
+              <p className="text-gray-500 mt-2 text-sm">Release to unlock</p>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         <div className="w-full max-w-sm text-left mx-auto">
           <div className="flex md:hidden mb-10">
             {branding?.logoBase64 ? (
@@ -667,26 +740,36 @@ export default function App() {
                     <span className="text-[#0073bb] font-normal hover:underline cursor-pointer ml-1" onClick={reset}>(Change?)</span>
                   )}
                 </label>
-                <div className="w-full px-3 py-1.5 text-[14px] bg-[#f2f3f3] border border-[#aab7b8] rounded-[2px] text-[#545b64] font-mono truncate">
+                <div className="w-full px-3 py-1.5 text-[14px] bg-[#f2f3f3] border border-[#aab7b8] rounded-[2px] text-[#545b64] font-mono truncate flex items-center">
+                  <FileText className="w-4 h-4 mr-2 shrink-0 text-[#0073bb]" />
                   {meta?.originalName}
                 </div>
               </div>
 
               <div className="mb-4">
                 <label className="block text-[14px] font-medium text-[#16191f] mb-1">Password</label>
-                <input
-                  type={showPassword ? "text" : "password"}
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && decryptVault()}
-                  className={`w-full px-3 py-1.5 text-[14px] bg-white border ${errorMsg ? 'border-[#d13212] focus:border-[#d13212] focus:shadow-[0_0_0_1px_#d13212]' : 'border-[#aab7b8] focus:border-[#0073bb] focus:shadow-[0_0_0_1px_#0073bb]'} rounded-[2px] focus:outline-none transition-shadow`} />
+                <motion.div 
+                  className="relative"
+                  animate={errorMsg ? { x: [-10, 10, -10, 10, 0] } : {}}
+                  transition={{ duration: 0.4 }}
+                >
+                  <input
+                    autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck="false"
+                    type={showPassword ? "text" : "password"}
+                    value={password}
+                    onChange={(e) => { setPassword(e.target.value); setErrorMsg(''); }}
+                    onKeyDown={(e) => e.key === 'Enter' && decryptVault()}
+                    className={`w-full pl-3 pr-10 py-1.5 text-[14px] bg-white border ${errorMsg ? 'border-[#d13212] focus:border-[#d13212] focus:shadow-[0_0_0_1px_#d13212]' : 'border-[#aab7b8] focus:border-[#0073bb] focus:shadow-[0_0_0_1px_#0073bb]'} rounded-[2px] focus:outline-none transition-shadow`} />
+                  <button 
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute right-2.5 top-[7px] text-[#545b64] hover:text-[#16191f] focus:outline-none"
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </motion.div>
               </div>
 
-              <div className="flex items-center justify-between mb-6">
-                <label className="flex items-center text-[13px] text-[#16191f] cursor-pointer">
-                  <input type="checkbox" className="mr-2 w-3.5 h-3.5 border-[#545b64] rounded-sm cursor-pointer accent-[#0073bb]" checked={showPassword} onChange={() => setShowPassword(!showPassword)} />
-                  Show Password
-                </label>
+              <div className="mb-6 flex justify-end">
                 {meta?.hint && (
                   <span className="text-[13px] text-[#0073bb] hover:underline cursor-help" title={meta.hint}>Having trouble?</span>
                 )}
@@ -700,6 +783,11 @@ export default function App() {
                   'Unlock & Download'
                 )}
               </button>
+              
+              <div className="mt-4 flex items-start gap-2 text-[12px] text-gray-500 bg-[#f8f9fa] p-3 rounded border border-gray-200">
+                <ShieldAlert className="w-4 h-4 text-[#10B981] shrink-0 mt-0.5" />
+                <span><strong>100% Local Decryption:</strong> Your password is never sent to our servers. All decryption happens securely within this browser tab.</span>
+              </div>
 
               {errorMsg && (
                 <div className="mt-4 p-3 rounded-[2px] text-[13px] border-l-4 border-[#d13212] bg-[#fdf3f1] text-[#d13212] flex items-start">
