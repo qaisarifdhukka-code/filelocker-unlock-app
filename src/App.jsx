@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { argon2id } from 'hash-wasm';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ShieldAlert, AlertCircle, Loader2, Eye, EyeOff, Download, FileText, CheckCircle2, Circle, XCircle } from 'lucide-react';
+import { ShieldAlert, AlertCircle, Loader2, Eye, EyeOff, Download, FileText, CheckCircle2, Circle, XCircle, Copy } from 'lucide-react';
 import SecurePDFViewer from './components/SecurePDFViewer';
 import SecureImageViewer from './components/SecureImageViewer';
 import { SecureMediaViewer } from './components/SecureMediaViewer';
@@ -96,6 +96,13 @@ export default function App() {
   const [isCloudLoading, setIsCloudLoading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
+  
+  // OTP Verification States
+  const [email, setEmail] = useState('');
+  const [otp, setOtp] = useState('');
+  const [otpSending, setOtpSending] = useState(false);
+  const [otpVerifying, setOtpVerifying] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
 
   // Prevent accidental close during decryption
   useEffect(() => {
@@ -195,15 +202,43 @@ export default function App() {
       
       // The API endpoint is POST /api/links/:link_id/download
       const API_BASE = APP_CONFIG.API_URL;
+      const sessionToken = sessionStorage.getItem(`filelocker_session_${linkId}`);
+      const headers = {};
+      if (sessionToken) headers['Authorization'] = `Bearer ${sessionToken}`;
+
+      // First check metadata to see if OTP is required
+      const metaRes = await fetch(`${API_BASE}/api/links/${linkId}`);
+      if (!metaRes.ok) throw new Error('Secure link not found.');
+      const linkMeta = await metaRes.json();
+      
+      if (linkMeta.status === 'expired') {
+        throw new Error('Link is expired.');
+      }
+      if (linkMeta.status === 'consumed') {
+        // Technically still downloadable for 6 hours if session is valid, which backend handles
+      }
+
+      if (linkMeta.require_email_otp && !sessionToken) {
+        setIsCloudLoading(false);
+        setStatus('EMAIL_PROMPT');
+        return true;
+      }
+
       // Use a HEAD request to get the content-length without downloading the body!
       const initialRes = await fetch(`${API_BASE}/api/links/${linkId}/download`, {
-        method: 'HEAD'
+        method: 'HEAD',
+        headers
       });
 
       if (!initialRes.ok) {
         let msg = 'Failed to download secure vault.';
         if (initialRes.status === 403) {
-          msg = 'Link is expired, consumed, or not found.';
+          msg = 'Link is expired, consumed, or email verification is required.';
+          if (linkMeta.require_email_otp && !sessionToken) {
+            setIsCloudLoading(false);
+            setStatus('EMAIL_PROMPT');
+            return true;
+          }
         } else if (initialRes.status === 404) {
           msg = 'Secure link not found.';
         }
@@ -229,9 +264,11 @@ export default function App() {
         const fetchChunk = async (start, end, retries = 3) => {
           for (let i = 0; i < retries; i++) {
             try {
+              const reqHeaders = { 'Range': `bytes=${start}-${end}` };
+              if (sessionToken) reqHeaders['Authorization'] = `Bearer ${sessionToken}`;
               const res = await fetch(`${API_BASE}/api/links/${linkId}/download`, {
                 method: 'POST', // Use POST for range request as required by backend
-                headers: { 'Range': `bytes=${start}-${end}` }
+                headers: reqHeaders
               });
               if (!res.ok) throw new Error(`HTTP ${res.status}`);
               return new Uint8Array(await res.arrayBuffer());
@@ -253,7 +290,10 @@ export default function App() {
         vaultFile = await handle.getFile();
       } else {
         // Standard in-memory blob for small files (we still need to actually download it since we used HEAD)
-        const fullRes = await fetch(`${API_BASE}/api/links/${linkId}/download`, { method: 'POST' });
+        const fullRes = await fetch(`${API_BASE}/api/links/${linkId}/download`, { 
+          method: 'POST',
+          headers
+        });
         
         if (!fullRes.ok) {
           let msg = 'Failed to download secure vault.';
@@ -282,6 +322,30 @@ export default function App() {
       setFile(vaultFile);
       setMeta({ ...parsedMeta, dataStart });
       setBranding(parsedMeta.branding || null);
+
+      // ── Auto-Key Detection (OTP-Only Mode) ─────────────────────────────────
+      // The key might be in the URL hash (first visit) or sessionStorage (refresh)
+      const hash = window.location.hash;
+      const keyMatch = hash.match(/[#&]key=([A-Za-z0-9_-]+)/);
+      let autoKey = null;
+
+      if (keyMatch) {
+        autoKey = keyMatch[1];
+        // Cache the key in sessionStorage so it survives page refreshes
+        sessionStorage.setItem(`filelocker_autokey_${linkId}`, autoKey);
+        // Remove the key from the URL bar immediately for security.
+        history.replaceState(null, '', window.location.pathname + window.location.search);
+      } else {
+        autoKey = sessionStorage.getItem(`filelocker_autokey_${linkId}`);
+      }
+
+      if (autoKey) {
+        // Bug Fix: Set these immediately before state settles to prevent the password UI from flickering
+        setIsDeriving(true);
+        setStatus('DECRYPTING');
+        // Trigger auto-decryption. Pass the key directly; bypass password prompt entirely.
+        setTimeout(() => decryptVaultWithKey(autoKey, parsedMeta, dataStart, vaultFile), 50);
+      }
       
     } catch (err) {
       setErrorMsg(err.message);
@@ -390,178 +454,190 @@ export default function App() {
     }
   };
 
-  // ── Decrypt vault ──────────────────────────────────────────────────────────
+  // ── Core Decryption Pipeline ────────────────────────────────────────────────
+  // Called by both decryptVault (password UI) and decryptVaultWithKey (auto-key / OTP-only).
+  // `passwordStr` is the plaintext password string. `targetFile` and `targetMeta` default
+  // to the current React state values so existing callers require no changes.
+  const runDecryptionPipeline = async (passwordStr, targetFile, targetMeta) => {
+    const resolvedFile = targetFile || file;
+    const resolvedMeta = targetMeta || meta;
+    if (!resolvedFile || !resolvedMeta) throw new Error('No vault loaded.');
+
+    setIsDeriving(true);
+    setErrorMsg('');
+
+    // Derive key with Argon2id using a Web Worker to prevent UI freezing
+    const salt = hexToBytes(resolvedMeta.salt);
+    const keyArray = await new Promise((resolve, reject) => {
+      const worker = new Argon2Worker();
+      worker.onmessage = (e) => {
+        if (e.data.success) resolve(e.data.keyArray);
+        else reject(new Error(e.data.error));
+        worker.terminate();
+      };
+      worker.onerror = () => { reject(new Error('Key derivation failed')); worker.terminate(); };
+      worker.postMessage({ password: passwordStr, salt });
+    });
+
+    const key = await crypto.subtle.importKey('raw', keyArray, { name: 'AES-GCM' }, false, ['decrypt']);
+
+    let downloadName = resolvedMeta.originalName;
+    if (resolvedMeta.encryptedName) {
+      try {
+        const encNameBuf = hexToBytes(resolvedMeta.encryptedName);
+        const nameIv = encNameBuf.slice(0, 12);
+        const nameTag = encNameBuf.slice(12, 28);
+        const nameData = encNameBuf.slice(28);
+        const combinedName = new Uint8Array(nameData.byteLength + nameTag.byteLength);
+        combinedName.set(new Uint8Array(nameData), 0);
+        combinedName.set(new Uint8Array(nameTag), nameData.byteLength);
+        const decName = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nameIv }, key, combinedName);
+        downloadName = new TextDecoder().decode(decName);
+      } catch(e) {
+        throw new Error('Invalid password or corrupted vault file.');
+      }
+    }
+
+    // PRE-FLIGHT CHECK: Attempt to decrypt the first chunk to verify the password/key
+    const dataStart = resolvedMeta.dataStart;
+    const dataSize  = resolvedFile.size - dataStart;
+    const firstChunkBuf = await resolvedFile.slice(dataStart, dataStart + CHUNK_ENC).arrayBuffer();
+    if (firstChunkBuf.byteLength >= 28) {
+      const iv = firstChunkBuf.slice(0, 12);
+      const tag = firstChunkBuf.slice(12, 28);
+      const data = firstChunkBuf.slice(28);
+      const combined = new Uint8Array(data.byteLength + tag.byteLength);
+      combined.set(new Uint8Array(data), 0);
+      combined.set(new Uint8Array(tag), data.byteLength);
+      await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, combined);
+    }
+
+    setPassword('');
+
+    // Authorize session with server (increments view_count exactly once)
+    if (!isEmbedded && window.location.protocol !== 'file:') {
+      const pathParts = window.location.pathname.split('/').filter(Boolean);
+      if (pathParts.length >= 2) {
+        const linkId = pathParts[pathParts.length - 1];
+        const API_BASE = APP_CONFIG.API_URL;
+        const sessionHeaders = { 'Content-Type': 'application/json' };
+        const existingToken = sessionStorage.getItem(`filelocker_session_${linkId}`);
+        if (existingToken) sessionHeaders['Authorization'] = `Bearer ${existingToken}`;
+        const sessionRes = await fetch(`${API_BASE}/api/links/${linkId}/session`, {
+          method: 'POST',
+          headers: sessionHeaders
+        });
+        if (!sessionRes.ok) {
+          let msg = 'Failed to authorize session.';
+          try { const errData = await sessionRes.json(); if (errData.error) msg = errData.error; } catch(e) {}
+          throw new Error(msg);
+        }
+        const sessionData = await sessionRes.json();
+        if (sessionData.sessionToken) {
+          sessionStorage.setItem(`filelocker_session_${linkId}`, sessionData.sessionToken);
+        }
+      }
+    }
+
+    setIsDeriving(false);
+    setStatus('DECRYPTING');
+    setProgress(0);
+    setDecryptStage(1);
+
+    // In secure_view mode, ALWAYS collect into memory
+    const isSecureView = resolvedMeta.viewerConfig?.mode === 'secure_view';
+    let writable;
+    let chunks = [];
+    const isFallback = !window.showSaveFilePicker || isSecureView;
+    const LARGE_FILE_THRESHOLD = 150 * 1024 * 1024;
+    const useOPFSFallback = isFallback && (resolvedFile.size >= LARGE_FILE_THRESHOLD) && navigator.storage;
+    let opfsDecryptedHandle = null;
+
+    if (!isFallback) {
+      try {
+        const saveFh = await window.showSaveFilePicker({ suggestedName: downloadName });
+        writable = await saveFh.createWritable();
+      } catch (err) {
+        throw new Error(`Failed to save file: ${err.message}.`);
+      }
+    } else if (useOPFSFallback) {
+      try {
+        const root = await navigator.storage.getDirectory();
+        opfsDecryptedHandle = await root.getFileHandle(`decrypted_${Date.now()}_${downloadName}`, { create: true });
+        trackOpfsHandle(opfsDecryptedHandle);
+        writable = await opfsDecryptedHandle.createWritable();
+      } catch (err) {
+        throw new Error(`Secure View for large files requires browser local storage (OPFS). (${err.message})`);
+      }
+    }
+
+    let offset = dataStart;
+    while (offset < resolvedFile.size) {
+      const chunkBuf = await resolvedFile.slice(offset, offset + CHUNK_ENC).arrayBuffer();
+      if (chunkBuf.byteLength < 28) break;
+      const iv = chunkBuf.slice(0, 12);
+      const tag = chunkBuf.slice(12, 28);
+      const data = chunkBuf.slice(28);
+      const combined = new Uint8Array(data.byteLength + tag.byteLength);
+      combined.set(new Uint8Array(data), 0);
+      combined.set(new Uint8Array(tag), data.byteLength);
+      const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, combined);
+      if (!isFallback) await writable.write(dec);
+      else if (useOPFSFallback) await writable.write(dec);
+      else chunks.push(new Uint8Array(dec));
+      offset += chunkBuf.byteLength;
+      setProgress(Math.min(100, Math.round(((offset - dataStart) / dataSize) * 100)));
+    }
+
+    setDecryptStage(2);
+
+    if (isSecureView) {
+      const mimeType = getMimeType(resolvedMeta.ext);
+      let blob;
+      if (useOPFSFallback) { await writable.close(); blob = await opfsDecryptedHandle.getFile(); }
+      else { blob = new Blob(chunks, { type: mimeType }); }
+      const url = URL.createObjectURL(blob);
+      const viewType = getViewerType(resolvedMeta.ext);
+      if (viewType === 'text') { const text = await blob.text(); setTextContent(text); }
+      setViewerBlobUrl(url);
+      setStatus('VIEWING');
+    } else if (isFallback) {
+      let blob;
+      if (useOPFSFallback) { await writable.close(); blob = await opfsDecryptedHandle.getFile(); }
+      else { blob = new Blob(chunks); }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = downloadName;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setStatus('DONE');
+    } else {
+      await writable.close();
+      setStatus('DONE');
+    }
+  };
+
+  // ── Auto-decrypt for OTP-only links (called with auto-key from URL hash) ─────
+  const decryptVaultWithKey = async (autoKey, overrideMeta, overrideDataStart, overrideFile) => {
+    const resolvedMeta = overrideMeta ? { ...overrideMeta, dataStart: overrideDataStart } : meta;
+    const resolvedFile = overrideFile || file;
+    try {
+      await runDecryptionPipeline(autoKey, resolvedFile, resolvedMeta);
+    } catch (err) {
+      console.error(err);
+      setIsDeriving(false);
+      setStatus('ERROR');
+      setErrorMsg('Auto-decryption failed. The link may be corrupted or the key was stripped. Please ask the sender to resend the full link including the #key= portion.');
+    }
+  };
+
+  // ── Decrypt vault (password UI path) ───────────────────────────────────────
   const decryptVault = async () => {
     if (!password) { setErrorMsg('Please enter a password.'); return; }
     if (isDeriving) return;
 
     try {
-      setIsDeriving(true);
-      setErrorMsg('');
-
-      // Derive key with Argon2id using a Web Worker to prevent UI freezing
-      const salt = hexToBytes(meta.salt);
-      const keyArray = await new Promise((resolve, reject) => {
-        const worker = new Argon2Worker();
-        worker.onmessage = (e) => {
-          if (e.data.success) {
-            resolve(e.data.keyArray);
-          } else {
-            reject(new Error(e.data.error));
-          }
-          worker.terminate();
-        };
-        worker.onerror = (err) => {
-          reject(new Error('Key derivation failed'));
-          worker.terminate();
-        };
-        worker.postMessage({ password, salt });
-      });
-      
-      const key = await crypto.subtle.importKey(
-        'raw', 
-        keyArray, 
-        { name: 'AES-GCM' }, 
-        false, 
-        ['decrypt']
-      );
-
-      let downloadName = meta.originalName;
-      if (meta.encryptedName) {
-        try {
-          const encNameBuf = hexToBytes(meta.encryptedName);
-          const nameIv = encNameBuf.slice(0, 12);
-          const nameTag = encNameBuf.slice(12, 28);
-          const nameData = encNameBuf.slice(28);
-          const combinedName = new Uint8Array(nameData.byteLength + nameTag.byteLength);
-          combinedName.set(new Uint8Array(nameData), 0);
-          combinedName.set(new Uint8Array(nameTag), nameData.byteLength);
-          const decName = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: nameIv }, key, combinedName);
-          downloadName = new TextDecoder().decode(decName);
-        } catch(e) {
-          throw new Error('Invalid password or corrupted vault file.');
-        }
-      }
-
-      // PRE-FLIGHT CHECK: Attempt to decrypt the first chunk to verify the password
-      // BEFORE asking the user where to save the file.
-      const dataStart = meta.dataStart;
-      const dataSize  = file.size - dataStart;
-      
-      const firstChunkBuf = await file.slice(dataStart, dataStart + CHUNK_ENC).arrayBuffer();
-      if (firstChunkBuf.byteLength >= 28) {
-        const iv       = firstChunkBuf.slice(0, 12);
-        const tag      = firstChunkBuf.slice(12, 28);
-        const data     = firstChunkBuf.slice(28);
-        const combined = new Uint8Array(data.byteLength + tag.byteLength);
-        combined.set(new Uint8Array(data), 0);
-        combined.set(new Uint8Array(tag), data.byteLength);
-        // If password is wrong, this will throw an OperationError instantly
-        await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, combined);
-      }
-      
-      setPassword('');
-
-      // If we reach here, the password is correct!
-      setIsDeriving(false);
-      setStatus('DECRYPTING');
-      setProgress(0);
-      setDecryptStage(1);
-
-      // In secure_view mode, ALWAYS collect into memory (never stream to disk)
-      const isSecureView = meta.viewerConfig?.mode === 'secure_view';
-      let writable;
-      let chunks = [];
-      const isFallback = !window.showSaveFilePicker || isSecureView;
-      
-      const LARGE_FILE_THRESHOLD = 150 * 1024 * 1024;
-      const useOPFSFallback = isFallback && (file.size >= LARGE_FILE_THRESHOLD) && navigator.storage;
-      let opfsDecryptedHandle = null;
-
-      if (!isFallback) {
-        try {
-          const saveFh = await window.showSaveFilePicker({ suggestedName: downloadName });
-          writable = await saveFh.createWritable();
-        } catch (err) {
-          throw new Error(`Failed to save file: ${err.message}. If you are trying to save to a protected folder, please select a different location.`);
-        }
-      } else if (useOPFSFallback) {
-        try {
-          const root = await navigator.storage.getDirectory();
-          opfsDecryptedHandle = await root.getFileHandle(`decrypted_${Date.now()}_${downloadName}`, { create: true });
-          trackOpfsHandle(opfsDecryptedHandle);
-          writable = await opfsDecryptedHandle.createWritable();
-        } catch (err) {
-          throw new Error(`Secure View for large files requires browser local storage (OPFS), which is restricted when opening HTML files locally in this browser. Please use the secure cloud link instead, or ask the sender to allow downloading. (Technical error: ${err.message})`);
-        }
-      }
-      let offset = dataStart;
-      
-      while (offset < file.size) {
-        const chunkBuf = await file.slice(offset, offset + CHUNK_ENC).arrayBuffer();
-        if (chunkBuf.byteLength < 28) break; // too small to be a valid chunk
-
-        const iv       = chunkBuf.slice(0, 12);
-        const tag      = chunkBuf.slice(12, 28);
-        const data     = chunkBuf.slice(28);
-
-        // WebCrypto expects [ciphertext || tag]
-        const combined = new Uint8Array(data.byteLength + tag.byteLength);
-        combined.set(new Uint8Array(data), 0);
-        combined.set(new Uint8Array(tag), data.byteLength);
-
-        const dec = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, combined);
-        if (!isFallback) await writable.write(dec);
-        else if (useOPFSFallback) await writable.write(dec);
-        else chunks.push(new Uint8Array(dec));
-
-        offset += chunkBuf.byteLength;
-        setProgress(Math.min(100, Math.round(((offset - dataStart) / dataSize) * 100)));
-      }
-
-      setDecryptStage(2);
-
-      if (isSecureView) {
-        // Secure View mode: render in-browser viewer
-        const mimeType = getMimeType(meta.ext);
-        let blob;
-        if (useOPFSFallback) {
-          await writable.close();
-          blob = await opfsDecryptedHandle.getFile();
-        } else {
-          blob = new Blob(chunks, { type: mimeType });
-        }
-        
-        const url = URL.createObjectURL(blob);
-        const viewType = getViewerType(meta.ext);
-        if (viewType === 'text') {
-          // Pre-load text content for display
-          const text = await blob.text();
-          setTextContent(text);
-        }
-        setViewerBlobUrl(url);
-        setStatus('VIEWING');
-      } else if (isFallback) {
-        let blob;
-        if (useOPFSFallback) {
-          await writable.close();
-          blob = await opfsDecryptedHandle.getFile();
-        } else {
-          blob = new Blob(chunks);
-        }
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = downloadName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-        setStatus('DONE');
-      } else {
-        await writable.close();
-        setStatus('DONE');
-      }
+      await runDecryptionPipeline(password, file, meta);
     } catch (err) {
       console.error(err);
       setIsDeriving(false);
@@ -590,6 +666,84 @@ export default function App() {
       setFile(null);
       setMeta(null);
       setBranding(null);
+    }
+    setEmail('');
+    setOtp('');
+  };
+
+  const handleSendOtp = async (e) => {
+    if (e) e.preventDefault();
+    if (!email) { setErrorMsg('Please enter your email address.'); return; }
+    
+    const pathParts = window.location.pathname.split('/').filter(Boolean);
+    const linkId = pathParts[pathParts.length - 1];
+    
+    try {
+      setOtpSending(true);
+      setErrorMsg('');
+      const res = await fetch(`${APP_CONFIG.API_URL}/api/links/${linkId}/send-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to send verification code.');
+      
+      setStatus('OTP_PROMPT');
+    } catch (err) {
+      setErrorMsg(err.message);
+    } finally {
+      setOtpSending(false);
+    }
+  };
+
+  const handleVerifyOtp = async (e) => {
+    if (e) e.preventDefault();
+    if (!otp) { setErrorMsg('Please enter the verification code.'); return; }
+    
+    const pathParts = window.location.pathname.split('/').filter(Boolean);
+    const linkId = pathParts[pathParts.length - 1];
+    
+    try {
+      setOtpVerifying(true);
+      setErrorMsg('');
+      const res = await fetch(`${APP_CONFIG.API_URL}/api/links/${linkId}/verify-otp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, otp })
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Invalid verification code.');
+      
+      // Save the OTP token
+      sessionStorage.setItem(`filelocker_session_${linkId}`, data.otpToken);
+      
+      // Resume loading the cloud vault now that we have OTP access
+      setStatus('IDLE');
+      setIsCloudLoading(true); // this gives visual feedback before the async fn finishes
+      setTimeout(() => {
+        hasAttemptedCloudLoad.current = false;
+        loadCloudVault();
+      }, 0);
+    } catch (err) {
+      setErrorMsg(err.message);
+    } finally {
+      setOtpVerifying(false);
+    }
+  };
+
+  const handleCopyLink = async () => {
+    try {
+      const pathParts = window.location.pathname.split('/').filter(Boolean);
+      const linkId = pathParts[pathParts.length - 1];
+      const autoKey = sessionStorage.getItem(`filelocker_autokey_${linkId}`);
+      let url = window.location.href.split('#')[0];
+      if (autoKey) url += `#key=${autoKey}`;
+      await navigator.clipboard.writeText(url);
+      setCopiedLink(true);
+      setTimeout(() => setCopiedLink(false), 2000);
+    } catch(err) {
+      console.error('Failed to copy link:', err);
     }
   };
 
@@ -907,6 +1061,14 @@ export default function App() {
                 </div>
               </div>
               
+              {(!meta?.maxViews || meta.maxViews > 1) && !isEmbedded && (
+                <button onClick={handleCopyLink}
+                  className="w-full py-1.5 px-4 mb-3 rounded-[2px] bg-[#f8f9fa] font-bold text-[#16191f] hover:bg-[#eaeded] transition-colors border border-[#aab7b8] shadow-[0_1px_1px_rgba(0,0,0,0.1)] flex items-center justify-center">
+                  {copiedLink ? <CheckCircle2 className="w-4 h-4 mr-2 text-green-600" /> : <Copy className="w-4 h-4 mr-2" />}
+                  {copiedLink ? 'Copied to Clipboard!' : 'Copy Secure Link to Share'}
+                </button>
+              )}
+              
               <button onClick={reset}
                 className="w-full py-1.5 px-4 rounded-[2px] bg-white font-bold text-[#16191f] hover:bg-[#f8f8f8] transition-colors border border-[#545b64] shadow-[0_1px_1px_rgba(0,0,0,0.1)]">
                 {isEmbedded ? 'Decrypt Again' : 'Unlock Another Vault'}
@@ -933,6 +1095,78 @@ export default function App() {
                 className="w-full py-1.5 px-4 rounded-[2px] bg-white font-bold text-[#16191f] hover:bg-[#f8f8f8] transition-colors border border-[#545b64] shadow-[0_1px_1px_rgba(0,0,0,0.1)]">
                 {isEmbedded ? 'Try Again' : 'Return to Sign In'}
               </button>
+            </motion.div>
+          )}
+
+          {/* STATE: EMAIL_PROMPT */}
+          {status === 'EMAIL_PROMPT' && (
+            <motion.div key="state-email" variants={fadeVariants} initial="initial" animate="animate" exit="exit" transition={{ duration: 0.2 }}>
+              <h2 className="text-[20px] font-bold mb-5 pb-3 border-b border-gray-200 text-[#16191f] flex items-center">
+                {branding?.firmName ? branding.firmName : "Vault Unlock"} <ShieldAlert className="w-[18px] h-[18px] ml-2 text-[#0073bb] stroke-[2px]" />
+              </h2>
+              <div className="mb-6">
+                <label className="block text-[14px] font-medium text-[#16191f] mb-1">Verify your email</label>
+                <p className="text-[13px] text-[#545b64] mb-3">Enter the email address this secure delivery was sent to.</p>
+                <form onSubmit={handleSendOtp}>
+                  <input
+                    type="email"
+                    value={email}
+                    onChange={(e) => { setEmail(e.target.value); setErrorMsg(''); }}
+                    placeholder="name@example.com"
+                    required
+                    className={`w-full px-3 py-1.5 text-[14px] bg-white border ${errorMsg ? 'border-[#d13212] focus:border-[#d13212] focus:shadow-[0_0_0_1px_#d13212]' : 'border-[#aab7b8] focus:border-[#0073bb] focus:shadow-[0_0_0_1px_#0073bb]'} rounded-[2px] focus:outline-none transition-shadow mb-4`}
+                  />
+                  <button type="submit" disabled={otpSending}
+                    className={`w-full py-1.5 px-4 rounded-[2px] font-bold text-white transition-colors border shadow-[0_1px_1px_rgba(0,0,0,0.1)] flex items-center justify-center ${otpSending ? 'bg-blue-400 border-blue-400 cursor-wait' : 'bg-[#2563EB] hover:bg-[#1d4ed8] border-[#1e40af]'}`}>
+                    {otpSending ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Sending...</> : 'Send Verification Code'}
+                  </button>
+                </form>
+              </div>
+              {errorMsg && (
+                <div className="mt-4 p-3 rounded-[2px] text-[13px] border-l-4 border-[#d13212] bg-[#fdf3f1] text-[#d13212] flex items-start">
+                  <AlertCircle className="w-4 h-4 mr-2 mt-0.5 shrink-0" />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {/* STATE: OTP_PROMPT */}
+          {status === 'OTP_PROMPT' && (
+            <motion.div key="state-otp" variants={fadeVariants} initial="initial" animate="animate" exit="exit" transition={{ duration: 0.2 }}>
+              <h2 className="text-[20px] font-bold mb-5 pb-3 border-b border-gray-200 text-[#16191f] flex items-center">
+                {branding?.firmName ? branding.firmName : "Vault Unlock"} <ShieldAlert className="w-[18px] h-[18px] ml-2 text-[#0073bb] stroke-[2px]" />
+              </h2>
+              <div className="mb-6">
+                <label className="block text-[14px] font-medium text-[#16191f] mb-1">Enter Verification Code</label>
+                <p className="text-[13px] text-[#545b64] mb-3">We sent a 6-digit code to <strong>{email}</strong>.</p>
+                <form onSubmit={handleVerifyOtp}>
+                  <input
+                    type="text"
+                    value={otp}
+                    onChange={(e) => { setOtp(e.target.value.replace(/[^0-9]/g, '')); setErrorMsg(''); }}
+                    placeholder="123456"
+                    maxLength={6}
+                    required
+                    className={`w-full px-3 py-1.5 text-[14px] font-mono tracking-widest text-center bg-white border ${errorMsg ? 'border-[#d13212] focus:border-[#d13212] focus:shadow-[0_0_0_1px_#d13212]' : 'border-[#aab7b8] focus:border-[#0073bb] focus:shadow-[0_0_0_1px_#0073bb]'} rounded-[2px] focus:outline-none transition-shadow mb-4`}
+                  />
+                  <button type="submit" disabled={otpVerifying || otp.length !== 6}
+                    className={`w-full py-1.5 px-4 rounded-[2px] font-bold text-white transition-colors border shadow-[0_1px_1px_rgba(0,0,0,0.1)] flex items-center justify-center ${(otpVerifying || otp.length !== 6) ? 'bg-blue-400 border-blue-400 cursor-not-allowed' : 'bg-[#2563EB] hover:bg-[#1d4ed8] border-[#1e40af]'}`}>
+                    {otpVerifying ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Verifying...</> : 'Verify & Continue'}
+                  </button>
+                </form>
+                <div className="mt-4 text-center">
+                  <button onClick={handleSendOtp} disabled={otpSending} className="text-[13px] text-[#0073bb] hover:underline focus:outline-none">
+                    {otpSending ? 'Resending...' : 'Resend Code'}
+                  </button>
+                </div>
+              </div>
+              {errorMsg && (
+                <div className="mt-4 p-3 rounded-[2px] text-[13px] border-l-4 border-[#d13212] bg-[#fdf3f1] text-[#d13212] flex items-start">
+                  <AlertCircle className="w-4 h-4 mr-2 mt-0.5 shrink-0" />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
             </motion.div>
           )}
 
@@ -971,6 +1205,13 @@ export default function App() {
                       <Eye className="w-5 h-5 text-[#2563EB]" /> Secure Viewer
                     </h2>
                     <div className="flex gap-2">
+                      {(!meta?.maxViews || meta.maxViews > 1) && !isEmbedded && (
+                        <button onClick={handleCopyLink}
+                          className="px-3 py-1 text-[12px] font-bold rounded border border-gray-300 text-gray-700 hover:bg-gray-50 transition-colors flex items-center gap-1">
+                          {copiedLink ? <CheckCircle2 className="w-3.5 h-3.5 text-green-600" /> : <Copy className="w-3.5 h-3.5" />}
+                          {copiedLink ? 'Copied' : 'Copy Link'}
+                        </button>
+                      )}
                       {allowPrint && (
                         <button onClick={handlePrint}
                           className="px-3 py-1 text-[12px] font-bold rounded border border-gray-300 text-gray-700 hover:bg-gray-50 transition-colors">
